@@ -20,6 +20,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <math.h>
+#include <sys/types.h>
+#include <sys/resource.h>
 #include <paths.h>
 
 #include <sys/wait.h>
@@ -31,11 +34,129 @@
 
 extern const char **environ;
 
+#define DECONST(t_,v_) ((t_)(uintptr_t)(const void *)(v_))
+
 // Lua version cruft
 
 #if LUA_VERSION_NUM < 503
 #error This code requires Lua 5.3 or later
 #endif
+
+//==========================================================================
+
+//
+// Lua container convenience functions.
+//
+// We define a value as "indexable" if it supports gettable, etc.; this is
+// true if it is a table or has a __index metavalue.
+//
+// We define a value as a "container" if it supports pairs() (not necessarily
+// ipairs) in a way that is likely to work; i.e. it is either a table with no
+// __index metavalue or it has a __pairs metamethod.
+//
+// We use pairs_start / pairs_next to do a pairs() loop from C while
+// respecting metamethods.
+//
+
+static bool
+is_indexable(lua_State *L, int nd)
+{
+	if (lua_type(L, nd) == LUA_TTABLE)
+		return true;
+	if (luaL_getmetafield(L, nd, "__index") != LUA_TNIL)
+	{
+		lua_pop(L, 1);
+		return true;
+	}
+	return false;
+}
+
+static bool
+is_container(lua_State *L, int nd)
+{
+	if (luaL_getmetafield(L, nd, "__pairs") != LUA_TNIL)
+	{
+		lua_pop(L, 1);
+		return true;
+	}
+	if (lua_type(L, nd) == LUA_TTABLE
+		&& luaL_getmetafield(L, nd, "__index") == LUA_TNIL)
+		return true;
+	lua_pop(L, 1);
+	return false;
+}
+
+// This is a full emulation of a lua "for k,v in pairs(t) do" loop, even
+// including the 5.4 close slot.
+//
+// toclose, if >0, specifies a stack slot to put the iterator's close object
+// into. This has no effect on 5.3, only on 5.4+. It's up to the caller to
+// ensure that it gets popped in a safe way at an appropriate time.
+
+static bool
+pairs_start(lua_State *L, int nd, int toclose, bool noerror)
+{
+	(void) toclose;
+	nd = lua_absindex(L, nd);
+	if (luaL_getmetafield(L, nd, "__pairs") == LUA_TNIL)
+	{
+		if (!noerror)
+			luaL_checktype(L, nd, LUA_TTABLE);
+		lua_pushnil(L); /* initial key for lua_next */
+		return false;
+	}
+#if LUA_VERSION_NUM >= 504
+	else if (toclose > 0)
+	{
+		lua_pushvalue(L, nd);
+		lua_call(L, 1, 4);
+		lua_replace(L, toclose);
+		lua_toclose(L, toclose);
+		return true;
+	}
+#endif
+	else
+	{
+		lua_pushvalue(L, nd);
+		lua_call(L, 1, 3);
+		return true;
+	}
+}
+
+// At call, the stack is:
+//
+//    iterfunc \ state \ key
+// or
+//    iterfunc \ nil \ key
+//
+// On true return, we leave
+//
+//	iterfunc \ state \ key \ value
+//
+// On false return, we pop all three
+//
+// The intended standard usage is:
+//
+// bool metaflag = pairs_start(...);
+// while (metaflag ? pairs_next(...) : lua_next(...)) { ... }
+//
+
+static int
+pairs_next(lua_State *L)
+{
+	lua_pushvalue(L, -3);	// iter state key iter
+	lua_pushvalue(L, -3);	// iter state key iter state
+	lua_rotate(L, -3, -1);	// iter state iter state key
+	lua_call(L, 2, 2);	  /* iter state key val */
+	if (lua_isnil(L, -2))
+	{
+		lua_pop(L, 4);
+		return 0;
+	}
+	return 1;
+}
+
+//==========================================================================
 
 //
 // File action objects for the user to populate the files={} table with.
@@ -302,346 +423,8 @@ lspawn_file_actions_new(lua_State *L)
 	return p;
 }
 
-//
-// Lua container convenience functions.
-//
-// We define a value as "indexable" if it supports gettable, etc.; this is
-// true if it is a table or has a __index metavalue.
-//
-// We define a value as a "container" if it supports pairs() (not necessarily
-// ipairs); i.e. it is either a table or has a __pairs metamethod. We assume
-// that a container is indexable consistently with its pairs() result (there's
-// no general way we could check this anyway).
-//
-// We use pairs_start / pairs_next to do a pairs() loop from C while
-// respecting metamethods.
-//
 
-static bool
-is_indexable(lua_State *L, int nd)
-{
-	if (lua_type(L, nd) == LUA_TTABLE)
-		return true;
-	if (luaL_getmetafield(L, nd, "__index") != LUA_TNIL)
-	{
-		lua_pop(L, 1);
-		return true;
-	}
-	return false;
-}
-
-static bool
-is_container(lua_State *L, int nd)
-{
-	if (lua_type(L, nd) == LUA_TTABLE)
-		return true;
-	if (luaL_getmetafield(L, nd, "__pairs") != LUA_TNIL)
-	{
-		lua_pop(L, 1);
-		return true;
-	}
-	return false;
-}
-
-// This is a full emulation of a lua "for k,v in pairs(t) do" loop, even
-// including the 5.4 close slot.
-//
-// toclose, if >0, specifies a stack slot to put the iterator's close object
-// into. This has no effect on 5.3, only on 5.4+. It's up to the caller to
-// ensure that it gets popped in a safe way at an appropriate time.
-
-static bool
-pairs_start(lua_State *L, int nd, int toclose, bool noerror)
-{
-	(void) toclose;
-	nd = lua_absindex(L, nd);
-	if (luaL_getmetafield(L, nd, "__pairs") == LUA_TNIL)
-	{
-		if (!noerror)
-			luaL_checktype(L, nd, LUA_TTABLE);
-		lua_pushnil(L); /* initial key for lua_next */
-		return false;
-	}
-#if LUA_VERSION_NUM >= 504
-	else if (toclose > 0)
-	{
-		lua_pushvalue(L, nd);
-		lua_call(L, 1, 4);
-		lua_replace(L, toclose);
-		lua_toclose(L, toclose);
-		return true;
-	}
-#endif
-	else
-	{
-		lua_pushvalue(L, nd);
-		lua_call(L, 1, 3);
-		return true;
-	}
-}
-
-// At call, the stack is:
-//
-//    iterfunc \ state \ key
-// or
-//    iterfunc \ nil \ key
-//
-// On true return, we leave
-//
-//	iterfunc \ state \ key \ value
-//
-// On false return, we pop all three
-//
-// The intended standard usage is:
-//
-// bool metaflag = pairs_start(...);
-// while (metaflag ? pairs_next(...) : lua_next(...)) { ... }
-//
-
-static int
-pairs_next(lua_State *L)
-{
-	lua_pushvalue(L, -3);	// iter state key iter
-	lua_pushvalue(L, -3);	// iter state key iter state
-	lua_rotate(L, -3, -1);	// iter state iter state key
-	lua_call(L, 2, 2);	  /* iter state key val */
-	if (lua_isnil(L, -2))
-	{
-		lua_pop(L, 4);
-		return 0;
-	}
-	return 1;
-}
-
-//
-// Given absolute stack indices of the command string and arg table, push (at
-// the current stack top) string values for argv[0..n-1] and return n. Note
-// that nothing is pushed for the terminating null, that's handled later.
-//
-
-static int
-process_args(lua_State *L, int cmd_idx, int argt_idx)
-{
-	bool have_argv0 = false;
-
-	// argv[0] is defaulted to the command string if not in the table
-
-	if (!lua_isnil(L, argt_idx))
-	{
-		if (lua_geti(L, argt_idx, 0) != LUA_TSTRING)
-		{
-			if (!lua_isnil(L, -1))
-				return luaL_argerror(L, 1, "bad value for args[0], expected string");
-			lua_pop(L, 1);
-		}
-		else
-			have_argv0 = true;
-	}
-
-	if (!have_argv0)
-		lua_pushvalue(L, cmd_idx);
-
-	int nargs = 1;
-
-	if (!lua_isnil(L, argt_idx))
-	{
-		while (lua_geti(L, argt_idx, nargs) != LUA_TNIL)
-		{
-			if ((nargs & 31) == 0)
-				luaL_checkstack(L, 80, "processing spawn arguments");
-			// note: isstring accepts numbers too
-			if (!lua_isstring(L, -1))
-				return luaL_argerror(L, 1, "bad value in args, expected string");
-			// force stringiness of value
-			lua_tostring(L, -1);
-			++nargs;
-		}
-	}
-
-	return nargs;
-}
-
-//
-// Given absolute stack indices of the env table, and a slot for an iterator
-// close object, push (at the current stack top) string values for
-// envp[0..n-1] and return n. Note that nothing is pushed for the terminating
-// null, that's handled later. Return -1 instead if we're just using the
-// existing environment unchanged. If inherit is false, start from a clean
-// slate, otherwise keep vars from the existing env (pushed as lightudata to
-// avoid overhead of interning strings).
-//
-
-static int
-process_envs(lua_State *L, int envt_idx, int iter_idx, bool inherit)
-{
-	int nenvs = 0;
-	bool have_env = !lua_isnil(L, envt_idx);
-
-	if (inherit && !have_env)
-		return -1;
-
-	if (inherit && environ)
-	{
-		for (int i = 0; environ[i]; ++i)
-		{
-			const char *name = environ[i];
-			const char *eq = strchr(name, '=');
-			int argt;
-
-			if (!eq || name == eq)
-				continue;
-
-			lua_pushlstring(L, name, eq - name);
-			argt = lua_gettable(L, envt_idx);
-			lua_pop(L, 1);
-
-			if (argt == LUA_TNIL)
-			{
-				// push these as light udata rather than as strings,
-				// to avoid the overhead of copying/interning them
-				lua_pushlightuserdata(L, (void*) name);
-				++nenvs;
-				if ((nenvs & 31) == 0)
-					luaL_checkstack(L, 80, "processing spawn environment");
-			}
-		}
-	}
-
-	if (have_env)
-	{
-		bool metaloop = pairs_start(L, envt_idx, iter_idx, false);
-
-		while (metaloop ? pairs_next(L) : lua_next(L, envt_idx))
-		{
-			// consider only string keys, and skip false values
-			if (lua_type(L, -2) != LUA_TSTRING
-				|| !lua_toboolean(L, -1))
-			{
-				lua_pop(L, 1);
-				continue;
-			}
-			// string or number values are ok
-			if (!lua_isstring(L, -1))
-				return luaL_argerror(L, 1, "bad value in environ, expected string");
-			// stack:  key \ value
-			lua_pushvalue(L, -2);
-			// stack:  key \ value \ key
-			lua_pushvalue(L, lua_upvalueindex(1));
-			// stack:  key \ value \ key \ "="
-			lua_rotate(L, -3, -1);
-			// stack:  key \ key \ "=" \ value
-			lua_concat(L, 3);
-			// stack:  [iterfunc \ state \] key \ key.."="..value
-			lua_rotate(L, (metaloop ? -4 : -2), 1);
-			// stack:  key.."="..value \ [iterfunc \ state \] key
-			++nenvs;
-			if ((nenvs & 31) == 0)
-				luaL_checkstack(L, 80, "processing spawn environment");
-		}
-	}
-
-	return nenvs;
-}
-
-// Given argv[0..n-1] and envp[0..e-1] on the lua stack starting at idx,
-// construct C-style argv[] and envp[] (with envp[] starting after argv[n])
-
-static void
-vectorize_args(lua_State *L,
-			   const char **argv,
-			   int idx,
-			   int nargs,
-			   int nenvs)
-{
-	int i = 0;
-
-	for (; nargs > 0; --nargs, ++idx)
-		argv[i++] = lua_tostring(L, idx);
-	argv[i++] = NULL;
-
-	if (nenvs < 0)
-		return;
-
-	for (; nenvs > 0; --nenvs, ++idx)
-		if (lua_islightuserdata(L, idx))
-			argv[i++] = lua_touserdata(L, idx);
-		else
-			argv[i++] = lua_tostring(L, idx);
-	argv[i++] = NULL;
-}
-
-// Given a sequence on the top of the lua stack, add the signals in it
-// to sigs_add and remove them from sigs_del. Signals can be specified
-// by name or number.
-
-static int
-process_siglist(lua_State *L, sigset_t *sigs_add, sigset_t *sigs_del)
-{
-	int argt;
-
-	for (int i = 1; (argt = lua_geti(L, -1, i)) != LUA_TNIL; ++i)
-	{
-		int isint = 0;
-		int rc = 0;
-		int sig;
-
-		if (argt != LUA_TNUMBER)
-			argt = lua_rawget(L, lua_upvalueindex(2));
-		sig = lua_tointegerx(L, -1, &isint);
-		if (isint)
-		{
-			if (sigs_add)
-				rc = sigaddset(sigs_add, sig);
-			if (rc == 0 && sigs_del)
-				rc = sigdelset(sigs_del, sig);
-		}
-		else
-			rc = -1;
-		if (rc < 0)
-			return luaL_argerror(L, 1, "bad entry in signals table");
-		lua_pop(L, 1);
-	}
-	lua_pop(L, 1);
-	return 0;
-}
-
-// process the signals argument.
-
-static int
-process_signals(lua_State *L,
-				int sigt_idx,
-				sigset_t *default_sigs,
-				sigset_t *ignore_sigs,
-				sigset_t *block_sigs)
-{
-	sigt_idx = lua_absindex(L, sigt_idx);
-
-	// initially default_sigs is full and the others empty.
-	// ignored sigs are added to ignore_sigs and removed from
-	// default_sigs; preserved sigs are removed from default_sigs;
-	// blocked sigs added to block_sigs.
-
-	lua_getfield(L, sigt_idx, "ignore");
-	if (is_indexable(L, -1))
-		process_siglist(L, ignore_sigs, default_sigs);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal ignore table, expected indexable value");
-
-	lua_getfield(L, sigt_idx, "block");
-	if (is_indexable(L, -1))
-		process_siglist(L, block_sigs, NULL);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal block table, expected indexable value");
-
-	lua_getfield(L, sigt_idx, "preserve");
-	if (is_indexable(L, -1))
-		process_siglist(L, NULL, default_sigs);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal preserve table, expected indexable value");
-
-	lua_pop(L, 3);
-	return 0;
-}
+// File actions processing
 
 static int
 file_act_err(lua_State *L, int err)
@@ -815,7 +598,7 @@ process_files(lua_State *L,
 	int pipe_child_fd = -1;
 	int pipe_parent_fd = -1;
 	int dst;
-	int nstack = 0;
+	int tmpt_idx = 0;
 	int *map_in_counts;
 	int *map_out_to_in;
 	int map_in_buf[128];
@@ -826,31 +609,47 @@ process_files(lua_State *L,
 	// unexpected non-integer keys. This gives us the high water mark for
 	// output fds.
 
+	// placeholder for temp table if needed
+	lua_pushnil(L);
+	tmpt_idx = lua_absindex(L, -1);
+
 	// placeholder for iterator close object
 	lua_pushnil(L);
 
 	bool metaloop = pairs_start(L, ftab_idx, lua_absindex(L, -1), false);
 
+	if (metaloop)
+	{
+		lua_createtable(L, 4, 1);
+		lua_replace(L, tmpt_idx);
+	}
+
 	while (metaloop ? pairs_next(L) : lua_next(L, ftab_idx))
 	{
 		// stack: [ initfunc \ state \ ] \ key \ value
-		lua_pop(L, 1);
 		int isint = 0;
-		int fd_out = lua_tointegerx(L, -1, &isint);
+		int fd_out = lua_tointegerx(L, -2, &isint);
 		if (!isint || fd_out < 0)
 			return luaL_argerror(L, 1, "bad entry in files table, expected integer key >= 0");
 		if (fd_out > hiwat_out)
 			hiwat_out = fd_out;
+		if (metaloop)
+			lua_rawseti(L, tmpt_idx, fd_out);
+		else
+			lua_pop(L, 1);
 	}
 
 	// pop the iterator close object if any (which will close it)
 	lua_pop(L, 1);
 
+	if (metaloop)
+		ftab_idx = tmpt_idx;
+
 	// Allocate a buffer (which we will abandon to the garbage collector)
 	// if there are more fds than we're prepared to accomodate on the stack.
 
 	if (hiwat_out + 1 >= countof(map_out_buf))
-		map_out_to_in = lua_newuserdata(L, (hiwat_out + 2) * sizeof(int));
+		map_out_to_in = lua_newuserdata(L, (unsigned)(hiwat_out + 2) * sizeof(int));
 	else
 		map_out_to_in = map_out_buf;
 
@@ -870,7 +669,7 @@ process_files(lua_State *L,
 
 		map_out_to_in[i] = -1;
 
-		switch (lua_geti(L, ftab_idx, i))
+		switch (lua_rawgeti(L, ftab_idx, i))
 		{
 			// Entries in the file table must be either a file action, a Lua
 			// FILE* which is treated as FA_INHERIT_FROM, or nil which is
@@ -887,9 +686,6 @@ process_files(lua_State *L,
 					{
 						case FA_INHERIT_FROM:
 							fd_in = p->value1;
-							break;
-						case FA_OPEN:
-							++nstack;
 							break;
 						case FA_INPIPE:
 						case FA_OUTPIPE:
@@ -938,7 +734,7 @@ process_files(lua_State *L,
 	}
 
 	if (hiwat_in + 1 >= countof(map_in_buf))
-		map_in_counts = lua_newuserdata(L, (hiwat_in + 2) * sizeof(int));
+		map_in_counts = lua_newuserdata(L, (unsigned)(hiwat_in + 2) * sizeof(int));
 	else
 		map_in_counts = map_in_buf;
 
@@ -1019,13 +815,11 @@ process_files(lua_State *L,
 	// Now process all other action types that don't copy from input
 	// fds. But do foreground_fd first if it needs it.
 
-	luaL_checkstack(L, 10 + nstack, "in process_files");
-
 	if (foreground_fd >= 0)
 	{
 		enum lspawn_fa_type fa_type = FA_INVALID;
 		struct lspawn_fa_data *p = NULL;
-		switch (lua_geti(L, ftab_idx, foreground_fd))
+		switch (lua_rawgeti(L, ftab_idx, foreground_fd))
 		{
 			case LUA_TNIL:
 				if (foreground_fd > 2)
@@ -1059,9 +853,10 @@ process_files(lua_State *L,
 			case FA_OPEN:
 			{
 				lua_getuservalue(L, -1);
-				lua_rotate(L, -2, 1);
-				const char *fname = lua_tostring(L, -2);
-				err = spawn_file_actions_addopen(facts, foreground_fd, fname, p->value1, p->value2);
+				const char *fname = lua_tostring(L, -1);
+				err = spawn_file_actions_addopen(facts, foreground_fd, fname, p->value1, (mode_t) p->value2);
+				// addopen copied the filename so we don't need to keep it on stack
+				lua_pop(L, 1);
 				break;
 			}
 			case FA_COPY_FROM:
@@ -1083,7 +878,7 @@ process_files(lua_State *L,
 		struct lspawn_fa_data *p = NULL;
 		if (i == foreground_fd)
 			continue;
-		switch (lua_geti(L, ftab_idx, i))
+		switch (lua_rawgeti(L, ftab_idx, i))
 		{
 			case LUA_TNIL:
 				switch (i)
@@ -1133,9 +928,10 @@ process_files(lua_State *L,
 			case FA_OPEN:
 			{
 				lua_getuservalue(L, -1);
-				lua_rotate(L, -2, 1);
-				const char *fname = lua_tostring(L, -2);
-				err = spawn_file_actions_addopen(facts, i, fname, p->value1, p->value2);
+				const char *fname = lua_tostring(L, -1);
+				err = spawn_file_actions_addopen(facts, i, fname, p->value1, (mode_t) p->value2);
+				// addopen copied the filename so we don't need to keep it on stack
+				lua_pop(L, 1);
 				break;
 			}
 			case FA_COPY_FROM:
@@ -1148,11 +944,582 @@ process_files(lua_State *L,
 		lua_pop(L, 1);
 	}
 
+	// pop the temp table slot
+	lua_pop(L, 1);
 	return 0;
 }
 
+//==========================================================================
 
-// Library proper begins here.
+// Arguments and environment
+
+//
+// Given absolute stack indices of the command string and arg table, push (at
+// the current stack top) string values for argv[0..n-1] and return n. Note
+// that nothing is pushed for the terminating null, that's handled later.
+//
+
+static int
+process_args(lua_State *L, int cmd_idx, int argt_idx)
+{
+	bool have_argv0 = false;
+
+	// argv[0] is defaulted to the command string if not in the table
+
+	if (!lua_isnil(L, argt_idx))
+	{
+		if (lua_geti(L, argt_idx, 0) != LUA_TSTRING)
+		{
+			if (!lua_isnil(L, -1))
+				return luaL_argerror(L, 1, "bad value for args[0], expected string");
+			lua_pop(L, 1);
+		}
+		else
+			have_argv0 = true;
+	}
+
+	if (!have_argv0)
+		lua_pushvalue(L, cmd_idx);
+
+	int nargs = 1;
+
+	if (!lua_isnil(L, argt_idx))
+	{
+		while (lua_geti(L, argt_idx, nargs) != LUA_TNIL)
+		{
+			if ((nargs & 31) == 0)
+				luaL_checkstack(L, 80, "processing spawn arguments");
+			// note: isstring accepts numbers too
+			if (!lua_isstring(L, -1))
+				return luaL_argerror(L, 1, "bad value in args, expected string");
+			// force stringiness of value
+			lua_tostring(L, -1);
+			++nargs;
+		}
+	}
+
+	return nargs;
+}
+
+//
+// Given absolute stack indices of the env table, and a slot for an iterator
+// close object, push (at the current stack top) string values for
+// envp[0..n-1] and return n. Note that nothing is pushed for the terminating
+// null, that's handled later. Return -1 instead if we're just using the
+// existing environment unchanged. If inherit is false, start from a clean
+// slate, otherwise keep vars from the existing env (pushed as lightudata to
+// avoid overhead of interning strings).
+//
+
+static int
+process_envs(lua_State *L, int envt_idx, int iter_idx, bool inherit)
+{
+	int nenvs = 0;
+	bool have_env = !lua_isnil(L, envt_idx);
+
+	if (inherit && !have_env)
+		return -1;
+
+	if (inherit && environ)
+	{
+		for (int i = 0; environ[i]; ++i)
+		{
+			const char *name = environ[i];
+			const char *eq = strchr(name, '=');
+			int argt;
+
+			if (!eq || name == eq)
+				continue;
+
+			lua_pushlstring(L, name, (size_t)(eq - name));
+			argt = lua_gettable(L, envt_idx);
+			lua_pop(L, 1);
+
+			if (argt == LUA_TNIL)
+			{
+				// push these as light udata rather than as strings,
+				// to avoid the overhead of copying/interning them
+				lua_pushlightuserdata(L, DECONST(void *, name));
+				++nenvs;
+				if ((nenvs & 31) == 0)
+					luaL_checkstack(L, 80, "processing spawn environment");
+			}
+		}
+	}
+
+	if (have_env)
+	{
+		bool metaloop = pairs_start(L, envt_idx, iter_idx, false);
+
+		while (metaloop ? pairs_next(L) : lua_next(L, envt_idx))
+		{
+			// consider only string keys, and skip false values
+			if (lua_type(L, -2) != LUA_TSTRING
+				|| !lua_toboolean(L, -1))
+			{
+				lua_pop(L, 1);
+				continue;
+			}
+			// string or number values are ok
+			if (!lua_isstring(L, -1))
+				return luaL_argerror(L, 1, "bad value in environ, expected string");
+			// stack:  key \ value
+			lua_pushvalue(L, -2);
+			// stack:  key \ value \ key
+			lua_pushvalue(L, lua_upvalueindex(2));
+			// stack:  key \ value \ key \ "="
+			lua_rotate(L, -3, -1);
+			// stack:  key \ key \ "=" \ value
+			lua_concat(L, 3);
+			// stack:  [iterfunc \ state \] key \ key.."="..value
+			lua_rotate(L, (metaloop ? -4 : -2), 1);
+			// stack:  key.."="..value \ [iterfunc \ state \] key
+			++nenvs;
+			if ((nenvs & 31) == 0)
+				luaL_checkstack(L, 80, "processing spawn environment");
+		}
+	}
+
+	return nenvs;
+}
+
+// Given argv[0..n-1] and envp[0..e-1] on the lua stack starting at idx,
+// construct C-style argv[] and envp[] (with envp[] starting after argv[n])
+
+static void
+vectorize_args(lua_State *L,
+			   const char **argv,
+			   int idx,
+			   int nargs,
+			   int nenvs)
+{
+	int i = 0;
+
+	for (; nargs > 0; --nargs, ++idx)
+		argv[i++] = lua_tostring(L, idx);
+	argv[i++] = NULL;
+
+	if (nenvs < 0)
+		return;
+
+	for (; nenvs > 0; --nenvs, ++idx)
+		if (lua_islightuserdata(L, idx))
+			argv[i++] = lua_touserdata(L, idx);
+		else
+			argv[i++] = lua_tostring(L, idx);
+	argv[i++] = NULL;
+}
+
+//==========================================================================
+
+// Signal handling
+
+// There may be signals above NSIG; but if so their names are not in
+// sys_signame. Such signals can be referred to only by number or by
+// defintions found elsewhere, e.g. in a POSIX module.
+
+static void
+make_signal_table(lua_State *L)
+{
+	lua_createtable(L, NSIG, NSIG);
+	for (int i = 1; i < NSIG; ++i)
+	{
+		lua_pushfstring(L, "SIG%s", sys_signame[i]);
+		lua_pushvalue(L, -1);
+		lua_pushinteger(L, i);
+		lua_rawset(L, -4);
+		lua_rawseti(L, -2, i);
+	}
+}
+
+// Given a sequence on the top of the lua stack, add the signals in it
+// to sigs_add and remove them from sigs_del. Signals can be specified
+// by name or number.
+
+static int
+process_siglist(lua_State *L, sigset_t *sigs_add, sigset_t *sigs_del)
+{
+	int argt;
+
+	for (int i = 1; (argt = lua_geti(L, -1, i)) != LUA_TNIL; ++i)
+	{
+		int isint = 0;
+		int rc = 0;
+		int sig;
+
+		if (argt != LUA_TNUMBER)
+			argt = lua_rawget(L, lua_upvalueindex(3));
+		sig = lua_tointegerx(L, -1, &isint);
+		if (isint)
+		{
+			if (sigs_add)
+				rc = sigaddset(sigs_add, sig);
+			if (rc == 0 && sigs_del)
+				rc = sigdelset(sigs_del, sig);
+		}
+		else
+			rc = -1;
+		if (rc < 0)
+			return luaL_argerror(L, 1, "bad entry in signals table");
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 1);
+	return 0;
+}
+
+// process the signals argument.
+
+static int
+process_signals(lua_State *L,
+				int sigt_idx,
+				sigset_t *default_sigs,
+				sigset_t *ignore_sigs,
+				sigset_t *block_sigs)
+{
+	sigt_idx = lua_absindex(L, sigt_idx);
+
+	// initially default_sigs is full and the others empty.
+	// ignored sigs are added to ignore_sigs and removed from
+	// default_sigs; preserved sigs are removed from default_sigs;
+	// blocked sigs added to block_sigs.
+
+	lua_getfield(L, sigt_idx, "ignore");
+	if (is_indexable(L, -1))
+		process_siglist(L, ignore_sigs, default_sigs);
+	else if (!lua_isnil(L, -1))
+		return luaL_argerror(L, 1, "bad signal ignore table, expected indexable value");
+
+	lua_getfield(L, sigt_idx, "block");
+	if (is_indexable(L, -1))
+		process_siglist(L, block_sigs, NULL);
+	else if (!lua_isnil(L, -1))
+		return luaL_argerror(L, 1, "bad signal block table, expected indexable value");
+
+	lua_getfield(L, sigt_idx, "preserve");
+	if (is_indexable(L, -1))
+		process_siglist(L, NULL, default_sigs);
+	else if (!lua_isnil(L, -1))
+		return luaL_argerror(L, 1, "bad signal preserve table, expected indexable value");
+
+	lua_pop(L, 3);
+	return 0;
+}
+
+//==========================================================================
+
+// Resource handling
+
+static uint64_t
+u64_mul(lua_State *L, uint64_t a, uint64_t b)
+{
+	uint64_t result;
+	bool overflow;
+
+#if __has_builtin(__builtin_mul_overflow)
+	overflow = __builtin_mul_overflow(a, b, &result);
+#else
+#error Missing overflow intrinsic
+#endif
+
+	if (overflow)
+		luaL_error(L, "numeric overflow in argument");
+	return result;
+}
+
+typedef bool (rv_mult)(char *ptr, uint64_t *mult);
+
+static bool
+rvm_size(char *ptr, uint64_t *multp)
+{
+	uint64_t mult = 1;
+
+	switch (*ptr)
+	{
+		case 0:
+			break;
+		case 'b': case 'B':
+			mult = 512;
+			break;
+		case 'k': case 'K':
+			mult = (1ULL << 10);
+			break;
+		case 'm': case 'M':
+			mult = (1ULL << 20);
+			break;
+		case 'g': case 'G':
+			mult = (1ULL << 30);
+			break;
+		case 't': case 'T':
+			mult = (1ULL << 40);
+			break;
+		default:
+			return false;
+	}
+
+	*multp = mult;
+	return true;
+}
+
+static bool
+rvm_time(char *ptr, uint64_t *multp)
+{
+	uint64_t mult = 1;
+
+	switch (*ptr)
+	{
+		case 0:
+			break;
+		case 's': case 'S':	/* seconds */
+			break;
+		case 'm': case 'M':	/* minutes */
+			mult = 60U;
+			break;
+		case 'h': case 'H':	/* hours */
+			mult = 60UL * 60UL;
+			break;
+		case 'd': case 'D':	/* days */
+			mult = 60UL * 60UL * 24UL;
+			break;
+		case 'w': case 'W':	/* weeks */
+			mult = 60UL * 60UL * 24UL * 7UL;
+			break;
+		case 'y': case 'Y':	/* 365-day years */
+			mult = 60UL * 60UL * 24UL * 365UL;
+			break;
+		default:
+			return false;
+	}
+
+	*multp = mult;
+	return true;
+}
+
+static rlim_t
+rv_from_string(lua_State *L,
+			   const char *ptr,
+			   rv_mult *func)
+{
+	char *endptr = NULL;
+	bool valid = false;
+
+	errno = 0;
+
+	uint64_t sz = strtoull(ptr, &endptr, 0);
+	uint64_t mult = 1;
+
+	if (endptr != ptr && errno == 0)
+	{
+		if (func)
+			valid = func(endptr, &mult);
+		else
+			valid = true;
+	}
+
+	sz = u64_mul(L, sz, mult);
+
+	if (!valid || sz > INT64_MAX || (rlim_t)sz == RLIM_INFINITY)
+		luaL_error(L, "invalid resource limit size");
+
+	return (rlim_t) sz;
+}
+
+static bool
+is_infinity_string(lua_State *L, int idx)
+{
+	const char *p = lua_tostring(L, idx);
+	if (p
+		&& (p[0] == 'I' || p[0] == 'i')
+		&& (p[1] == 'N' || p[1] == 'n')
+		&& (p[2] == 'F' || p[2] == 'f'))
+		return true;
+	return false;
+}
+
+static struct rlimit_entry {
+	rv_mult *mult;
+	const char *names[4];
+} rlimit_table[RLIM_NLIMITS] = {
+#ifdef RLIMIT_AS
+	[RLIMIT_AS]		= { rvm_size, {"as","vmemoryuse","vmem"} },
+#endif
+#ifdef RLIMIT_CORE
+	[RLIMIT_CORE]	= { rvm_size, {"core","coredumpsize"} },
+#endif
+#ifdef RLIMIT_CPU
+	[RLIMIT_CPU]	= { rvm_time, {"cpu","cputime"} },
+#endif
+#ifdef RLIMIT_DATA
+	[RLIMIT_DATA]	= { rvm_size, {"data","datasize"} },
+#endif
+#ifdef RLIMIT_FSIZE
+	[RLIMIT_FSIZE]	= { rvm_size, {"fsize","filesize"} },
+#endif
+#ifdef RLIMIT_KQUEUES
+	[RLIMIT_KQUEUES]= { NULL, {"kqueues"} },
+#endif
+#ifdef RLIMIT_MEMLOCK
+	[RLIMIT_MEMLOCK]= { rvm_size, {"memlock","memorylocked"} },
+#endif
+#ifdef RLIMIT_NOFILE
+	[RLIMIT_NOFILE]	= { NULL, {"nofile","openfiles"} },
+#endif
+#ifdef RLIMIT_NPROC
+	[RLIMIT_NPROC]	= { NULL, {"nproc","maxproc"} },
+#endif
+#ifdef RLIMIT_NPTS
+	[RLIMIT_NPTS]	= { NULL, {"npts","pseudoterminals"} },
+#endif
+#ifdef RLIMIT_RSS
+	[RLIMIT_RSS]	= { rvm_size, {"rss","memoryuse"} },
+#endif
+#ifdef RLIMIT_SBSIZE
+	[RLIMIT_SBSIZE]	= { rvm_size, {"sbsize"} },
+#endif
+#ifdef RLIMIT_STACK
+	[RLIMIT_STACK]	= { rvm_size, {"stack","stacksize"} },
+#endif
+#ifdef RLIMIT_SWAP
+	[RLIMIT_SWAP]	= { rvm_size, {"swap","swapuse"} },
+#endif
+#ifdef RLIMIT_UMTXP
+	[RLIMIT_UMTXP]	= { NULL, {"umtxp"} },
+#endif
+};
+
+static inline bool
+is_rvaltype(int vtype)
+{
+	return vtype == LUA_TBOOLEAN || vtype == LUA_TNUMBER || vtype == LUA_TSTRING;
+}
+
+// resource value can be a number (to set both soft and hard limits),
+// boolean false = 0 for certain limits, true or infinity = infinity,
+// string "infinity" = infinity, or an indexable with cur= max=.
+
+static rlim_t
+rv_getvalue(lua_State *L, int res, int vtype)
+{
+	switch (vtype)
+	{
+		case LUA_TBOOLEAN:
+			if (lua_toboolean(L, -1))
+				return RLIM_INFINITY;
+			else
+				return 0;
+
+		case LUA_TSTRING:
+			if (is_infinity_string(L, -1))
+				return RLIM_INFINITY;
+			return rv_from_string(L, lua_tostring(L, -1), rlimit_table[res].mult);
+
+		case LUA_TNUMBER:
+		{
+			int isint = 0;
+			lua_Integer val = lua_tointegerx(L, -1, &isint);
+			if (isint)
+				return val;
+			lua_Number nval = lua_tonumber(L, -1);
+			if (nval > 0 && isinf(nval))
+				return RLIM_INFINITY;
+			if (nval < 0
+				|| (nval > 0 && -nval <= (INT64_MIN)))
+				luaL_argerror(L, 1, "bad value in resources table");
+			return llrint(nval);
+		}
+
+		default:
+			luaL_argerror(L, 1, "bad value in resources table");
+	}
+}
+
+static bool
+process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
+{
+	bool result = false;
+
+	idx = lua_absindex(L, idx);
+
+	for (int res = 0; res < RLIM_NLIMITS; ++res)
+	{
+		if (rlimit_table[res].names[0] == NULL)
+			continue;
+
+		int vtype = lua_geti(L, idx, res);
+		for (int i = 0;
+			 vtype == LUA_TNIL
+				 && i < countof(rlimit_table[res].names)
+				 && rlimit_table[res].names[i];
+			 ++i)
+		{
+			lua_pop(L, 1);
+			vtype = lua_getfield(L, idx, rlimit_table[res].names[i]);
+		}
+
+		if (is_rvaltype(vtype))
+		{
+			rlim_t limval = rv_getvalue(L, res, vtype);
+			rlims[res].rlim_cur = limval;
+			rlims[res].rlim_max = limval;
+			rlim_set[res] = result = true;
+		}
+		else if (is_indexable(L, -1))
+		{
+			int vtype1 = lua_getfield(L, -1, "cur");
+			if (vtype1 == LUA_TNIL)
+			{
+				lua_pop(L, 1);
+				vtype1 = lua_getfield(L, -1, "rlim_cur");
+			}
+
+			int vtype2 = lua_getfield(L, -2, "max");
+			if (vtype2 == LUA_TNIL)
+			{
+				lua_pop(L, 1);
+				vtype2 = lua_getfield(L, -2, "rlim_max");
+			}
+
+			rlim_t val_cur;
+			rlim_t val_max;
+			bool cur_set = false;
+			bool max_set = false;
+			if (is_rvaltype(vtype2))
+			{
+				val_max = rv_getvalue(L, res, vtype2);
+				max_set = true;
+			}
+			else if (vtype2 != LUA_TNIL)
+				luaL_argerror(L, 1, "bad value in resources table");
+			lua_pop(L, 1);
+			if (is_rvaltype(vtype1))
+			{
+				val_cur = rv_getvalue(L, res, vtype1);
+				cur_set = true;
+			}
+			else if (vtype1 != LUA_TNIL)
+				luaL_argerror(L, 1, "bad value in resources table");
+			lua_pop(L, 1);
+			if (cur_set != max_set)
+				if (getrlimit(res, &rlims[res]) < 0)
+					luaL_error(L, "could not fetch resource limit (res %d, error %d)", res, errno);
+			if (cur_set)
+				rlims[res].rlim_cur = val_cur;
+			if (max_set)
+				rlims[res].rlim_max = val_max;
+			if (cur_set || max_set)
+				rlim_set[res] = result = true;
+		}
+		else if (vtype != LUA_TNIL)
+			luaL_argerror(L, 1, "bad value in resources table");
+		lua_pop(L, 1);
+	}
+
+	return result;
+}
+
+
+//==========================================================================
+
+// Actual main library code.
 
 static int lspawn_call(lua_State *L);
 
@@ -1167,6 +1534,7 @@ static RegMeta lspawn_lib_meta = {
 //
 // spawn {
 //   exec = boolean,        -- if true, exec() the process (no return)
+//   errprefix = string,    -- prefix for verbose errors
 //   program = string,		-- required; filename of executable
 //   args = table,			-- optional: argument strings
 //   environ = table,       -- optional: { NAME = string, ... }
@@ -1191,6 +1559,12 @@ static RegMeta lspawn_lib_meta = {
 //   directory = string,    -- chdir after processing files
 //   directory_before = string,
 //                          -- chdir before processing files
+//   chroot = string,       -- chroot after processing files
+//   chroot_before = string,
+//                          -- chroot before processing files
+//   resources = { [n] = {...} }
+//   jail_before = integer,
+//   jail_after = integer,
 //   files = { [n] = act, ... }
 // }
 //
@@ -1203,118 +1577,160 @@ static RegMeta lspawn_lib_meta = {
 #define SIDX_FILES		(SIDX_BASE + 3)
 #define SIDX_CHDIR		(SIDX_BASE + 4)
 #define SIDX_CHDIR_BEFORE (SIDX_BASE + 5)
-#define SIDX_SEARCHPATH	(SIDX_BASE + 6)
-#define SIDX_SIGNALS	(SIDX_BASE + 7)
+#define SIDX_CHROOT		(SIDX_BASE + 6)
+#define SIDX_CHROOT_BEFORE (SIDX_BASE + 7)
+#define SIDX_SEARCHPATH	(SIDX_BASE + 8)
+#define SIDX_VERBOSE	(SIDX_BASE + 9)
 
 // everything after this can be dropped after copying to locals
-#define SIDX__DROP1		(SIDX_BASE + 7)
+#define SIDX__DROP1		(SIDX_BASE + 9)
 
-#define SIDX_EXEC		(SIDX__DROP1 + 1)
-#define SIDX_RESET_IDS	(SIDX__DROP1 + 2)
-#define SIDX_SETSID		(SIDX__DROP1 + 3)
-#define SIDX_PGROUP		(SIDX__DROP1 + 4)
-#define SIDX_FOREGROUND	(SIDX__DROP1 + 5)
-#define SIDX_CLEANENV	(SIDX__DROP1 + 6)
+#define SIDX_SIGNALS	(SIDX__DROP1 + 1)
+#define SIDX_EXEC		(SIDX__DROP1 + 2)
+#define SIDX_RESET_IDS	(SIDX__DROP1 + 3)
+#define SIDX_SETSID		(SIDX__DROP1 + 4)
+#define SIDX_PGROUP		(SIDX__DROP1 + 5)
+#define SIDX_FOREGROUND	(SIDX__DROP1 + 6)
+#define SIDX_CLEANENV	(SIDX__DROP1 + 7)
+#define SIDX_JAIL_BEFORE (SIDX__DROP1 + 8)
+#define SIDX_JAIL_AFTER (SIDX__DROP1 + 9)
+#define SIDX_RESOURCES	(SIDX__DROP1 + 10)
 
-#define SIDX__LASTARG	(SIDX_BASE + 13)
+#define SIDX__LASTARG	(SIDX__DROP1 + 10)
 
-static int
+typedef const char *(validate_func)(lua_State *L, int typ);
+
+static const char *v_boolean(lua_State *L, int typ)
+{
+	return (typ == LUA_TBOOLEAN) ? NULL : "string";
+}
+static const char *v_string(lua_State *L, int typ)
+{
+	return (typ == LUA_TSTRING) ? NULL : "string";
+}
+static const char *v_indexable(lua_State *L, int typ)
+{
+	return is_indexable(L, -1) ? NULL : "table or indexable object";
+}
+static const char *v_container(lua_State *L, int typ)
+{
+	return is_container(L, -1) ? NULL : "table or container";
+}
+static const char *v_integer(lua_State *L, int typ)
+{
+	int isint = 0;
+	lua_tointegerx(L, -1, &isint);
+	return isint ? NULL : "integer";
+}
+static const char *v_int_or_bool(lua_State *L, int typ)
+{
+	int isint = 0;
+	lua_tointegerx(L, -1, &isint);
+	return (typ == LUA_TBOOLEAN || isint) ? NULL : "integer or boolean";
+}
+static const char *v_str_or_bool(lua_State *L, int typ)
+{
+	return (typ == LUA_TBOOLEAN || typ == LUA_TSTRING) ? NULL : "string or boolean";
+}
+
+// string "preserve" or a table
+static const char *v_s_signals(lua_State *L, int typ)
+{
+	if (typ != LUA_TTABLE
+		&& (typ != LUA_TSTRING
+			|| strcmp(lua_tostring(L, -1), "preserve") != 0))
+		return "table or string 'preserve'";
+	return NULL;
+}
+
+static const struct {
+	const char *keyname;
+	validate_func *isvalid;
+	bool required;
+} lspawn_args[] = {
+	[SIDX_PROGRAM]		=	{ "program",		v_string,		true },
+	[SIDX_ARGS]			=	{ "args",			v_indexable,	false },
+	[SIDX_ENVIRON]		=	{ "environ",		v_container,	false },
+	[SIDX_FILES]		=	{ "files",			v_container,	false },
+	[SIDX_CHDIR]		=	{ "directory",		v_string,		false },
+	[SIDX_CHDIR_BEFORE]	=	{ "directory_before", v_string,		false },
+	[SIDX_CHROOT]		=	{ "chroot",			v_string,		false },
+	[SIDX_CHROOT_BEFORE]=	{ "chroot_before", 	v_string, 		false },
+	[SIDX_SEARCHPATH]	=	{ "search_path", 	v_str_or_bool,	false },
+	[SIDX_SIGNALS]		=	{ "signals",		v_s_signals,	false },
+	[SIDX_RESOURCES]	=	{ "resources",		v_indexable,	false },
+	[SIDX_EXEC]			=	{ "exec",			v_boolean,		false },
+	[SIDX_RESET_IDS]	=	{ "reset_ids",		v_boolean,		false },
+	[SIDX_SETSID]		=	{ "new_session", 	v_boolean,		false },
+	[SIDX_PGROUP]		=	{ "process_group", 	v_int_or_bool,	false },
+	[SIDX_FOREGROUND]	=	{ "foreground_tty", v_int_or_bool,	false },
+	[SIDX_CLEANENV]		=	{ "clean_environ", 	v_boolean, 		false },
+	[SIDX_JAIL_BEFORE]	=	{ "jail_before", 	v_integer,		false },
+	[SIDX_JAIL_AFTER]	=	{ "jail_after",		v_integer,		false },
+	[SIDX_VERBOSE]		=	{ "verbose",		v_str_or_bool,	false },
+};
+
+static void
+lspawn_call_init_args(lua_State *L)
+{
+	lua_createtable(L, 0, countof(lspawn_args) + 1);
+	for (int i = 0; i < countof(lspawn_args); ++i)
+	{
+		if (lspawn_args[i].keyname)
+		{
+			lua_pushinteger(L, i);
+			lua_setfield(L, -2, lspawn_args[i].keyname);
+		}
+	}
+}
+
+static void
 lspawn_call_do_args(lua_State *L, int idx)
 {
-	const struct {
-		const char *keyname;
-		int expected_type;
-		bool required;
-	} table_args[] = {
-		[SIDX_PROGRAM]	=	{ "program",	LUA_TSTRING,	true },
-		[SIDX_ARGS]		=	{ "args",		LUA_TTABLE,		false },
-		[SIDX_ENVIRON]	=	{ "environ",	LUA_TTABLE,		false },
-		[SIDX_FILES]	=	{ "files",		LUA_TTABLE,		false },
-		[SIDX_CHDIR]	=	{ "directory",	LUA_TSTRING,	false },
-		[SIDX_CHDIR_BEFORE]={ "directory_before", LUA_TSTRING, false },
-		[SIDX_SEARCHPATH]=	{ "search_path", LUA_TNONE,		false },
-		[SIDX_SIGNALS]	=	{ "signals",	LUA_TNONE,		false },
-		[SIDX_EXEC]		=	{ "exec",		LUA_TBOOLEAN,	false },
-		[SIDX_RESET_IDS]=	{ "reset_ids",	LUA_TBOOLEAN,	false },
-		[SIDX_SETSID]	=	{ "new_session", LUA_TBOOLEAN,	false },
-		[SIDX_PGROUP]	=	{ "process_group", LUA_TNONE,	false },
-		[SIDX_FOREGROUND]=	{ "foreground_tty",	LUA_TNONE,	false },
-		[SIDX_CLEANENV]	=	{ "clean_environ", LUA_TBOOLEAN, false }
-	};
+	idx = lua_absindex(L, idx);
 
-	int stackp = lua_gettop(L);
-
-	for (int i = SIDX_BASE; i <= SIDX__LASTARG; ++i)
+	// Don't need the full pairs() pushups here, since we know
+	// the refidx table has no metatable
+	lua_pushnil(L);
+	while (lua_next(L, lua_upvalueindex(1)))
 	{
-		const char *expect = NULL;
-		int argt = lua_getfield(L, idx, table_args[i].keyname);
-		int expt = table_args[i].expected_type;
-		int isint = 0;
+		int i = lua_tointeger(L, -1);
 
-		if (table_args[i].required || argt != LUA_TNIL)
+		lua_copy(L, -2, -1);
+		int argt = lua_gettable(L, idx);
+
+		if (argt != LUA_TNIL)
 		{
-			switch (i)
-			{
-				case SIDX_SIGNALS:
-					// must be the string "preserve" or a table
-					if (argt == LUA_TSTRING)
-					{
-						if (strcmp(lua_tostring(L, -1), "preserve") != 0)
-							return luaL_argerror(L, 1, "bad action string in signals field");
-					}
-					else if (argt != LUA_TTABLE)
-						expect = "table or string";
-					break;
+			const char *expect = lspawn_args[i].isvalid(L, argt);
 
-				case SIDX_SEARCHPATH:
-					if ((argt != LUA_TSTRING) && (argt != LUA_TBOOLEAN))
-						expect = "string or boolean";
-					break;
+			if (expect)
+				luaL_error(L, "bad argument: field '%s' expected %s",
+						   lspawn_args[i].keyname, expect);
 
-				case SIDX_PGROUP:
-				case SIDX_FOREGROUND:
-					lua_tointegerx(L, -1, &isint);
-					if ((argt != LUA_TBOOLEAN) && !isint)
-						expect = "integer or boolean";
-					break;
-
-				default:
-					switch (expt)
-					{
-						case LUA_TTABLE:
-							// args only needs to be indexable, while files and
-							// environ need to support pairs()
-							if ((i == SIDX_ARGS)
-								? !is_indexable(L, -1)
-								: !is_container(L, -1))
-								expect = "table";
-							break;
-						case LUA_TNUMBER:	// actually requires "integer"
-							lua_tointegerx(L, -1, &isint);
-							if (!isint)
-								expect = "integer";
-							break;
-						default:
-							if (argt != expt)
-								expect = lua_typename(L, expt);
-							break;
-					}
-			}
+			lua_copy(L, -1, i);
 		}
-		if (expect)
-		{
-			char errbuf[128];
-			snprintf(errbuf, sizeof(errbuf),
-					 "bad %s field, expected %s",
-					 table_args[i].keyname, expect);
-			return luaL_argerror(L, 1, errbuf);
-		}
-		lua_copy(L, -1, i);
+		else if (lspawn_args[i].required)
+			luaL_error(L, "required field '%s' missing", lspawn_args[i].keyname);
+
+		lua_pop(L, 1);
 	}
 
-	lua_settop(L, stackp);
+	// Check the original arg table for spurious keys.
 
-	return 0;
+	lua_pushnil(L);
+
+	bool metaloop = pairs_start(L, idx, lua_absindex(L, -1), true);
+	while (metaloop ? pairs_next(L) : lua_next(L, idx))
+	{
+		lua_pushvalue(L, -2);
+		if (lua_type(L, -1) != LUA_TSTRING)
+			luaL_error(L, "key in argument table is not a string");
+		else if (lua_rawget(L, lua_upvalueindex(1)) == LUA_TNIL)
+			luaL_error(L, "unknown key '%s' in argument table", lua_tostring(L, -3));
+		lua_pop(L, 2);
+	}
+
+	lua_pop(L, 1);
 }
 
 // Actual main entry point.
@@ -1328,52 +1744,87 @@ lspawn_call(lua_State *L)
 	spawnattr_t	sa;
 	spawn_file_actions_t *file_acts;
 	short		spawn_attr_flags = (SPAWN_SETSIGDEF
-									| SPAWN_SETSIGIGN
+									| SPAWN_SETSIGIGN_NP
 									| SPAWN_SETSIGMASK);
 	pid_t		pgrp = 0;
+	int			jail_before = -1;
+	int			jail_after = -1;
+
+	bool		rlim_set[RLIM_NLIMITS];
+	struct rlimit rlim[RLIM_NLIMITS];
 
 	bool		do_exec = false;
 	bool		inherit_env = true;
 	int			foreground_fd = -1;
 	const char *filename;
 	const char *search_path = NULL;
+	const char *errprefix = NULL;
 
 	int			nargs = 0;
 	int			nenvs = -1;		// -1 == use environ unchanged
 
-	char	   *argvec[256];
-	char	  **argv = argvec;
-	char	  **envp;
+	const char *argvec[256];
+	const char **argv = argvec;
+	const char **envp;
 
 	pid_t		child_pid;
 	int			err;
 
-	// We might push a bunch of things for args, env vars, files, etc. We aim
-	// to keep 63 free slots minimum, and check for extension in indefinite
-	// loops after 32 iterations. Include a chunk of slop here to avoid
-	// unnecessary reallocs.
+	// We might push a bunch of things for args, env vars, etc. We aim to keep
+	// 63 free slots minimum, and check for extension in indefinite loops
+	// after 32 iterations. Include a chunk of slop here to avoid unnecessary
+	// reallocs.
 
-	luaL_checkstack(L, 100 + 2*SIDX__LASTARG, "in spawn");
+	luaL_checkstack(L, 100 + SIDX__LASTARG, "in spawn");
 
 	// Argument errors currently show as off-by-one in __call metamethods
 	// (which this is). Jiggle the stack to compensate.
 	if (verify_object_exact(L, 1, &lspawn_lib_meta))
 		lua_remove(L, 1);
 
-	if (lua_gettop(L) != 1)
-		return luaL_argerror(L, 1, "exactly one arg expected");
-
-	luaL_checktype(L, 1, LUA_TTABLE);
+	// Allow simplified call style of spawn(prog,arg,...) by converting it
+	// to the full table form; prog must be a string.
+	switch (lua_type(L, 1))
+	{
+		case LUA_TSTRING:
+		{
+			int n = lua_gettop(L) - 1;
+			lua_createtable(L, n, 0);
+			lua_insert(L, 1);
+			// table prog arg1 arg2 ... argn
+			for (; n >= 1; --n)
+			{
+				if (!lua_isstring(L, -1))
+					luaL_argerror(L, n+1, "expected string");
+				lua_rawseti(L, 1, n);
+			}
+			lua_createtable(L, 0, 1);
+			lua_insert(L, 1);
+			lua_setfield(L, 1, "program");
+			lua_setfield(L, 1, "args");
+			break;
+		}
+		case LUA_TTABLE:
+			break;
+		default:
+			return luaL_argerror(L, 1, "expected table or string");
+	}
 
 	// Process args and fill in all the stack slots.
 	lua_settop(L, SIDX__LASTARG);
 	lspawn_call_do_args(L, 1);
 
 	do_exec = lua_toboolean(L, SIDX_EXEC);
+	if (lua_toboolean(L, SIDX_VERBOSE)
+		|| (do_exec && lua_type(L, SIDX_VERBOSE) != LUA_TBOOLEAN))
+	{
+		errprefix = lua_tostring(L, SIDX_VERBOSE);
+		spawn_attr_flags |= SPAWN_VERBOSE_NP;
+	}
 	if (lua_toboolean(L, SIDX_RESET_IDS))
 		spawn_attr_flags |= SPAWN_RESETIDS;
 	if (lua_toboolean(L, SIDX_SETSID))
-		spawn_attr_flags |= SPAWN_SETSID;
+		spawn_attr_flags |= SPAWN_SETSID_NP;
 	if (lua_toboolean(L, SIDX_PGROUP))
 	{
 		pgrp = (pid_t) lua_tointeger(L, SIDX_PGROUP);
@@ -1383,9 +1834,32 @@ lspawn_call(lua_State *L)
 		foreground_fd = lua_tointeger(L, SIDX_FOREGROUND);
 	if (lua_toboolean(L, SIDX_CLEANENV))
 		inherit_env = false;
+	if (!lua_isnil(L, SIDX_JAIL_BEFORE))
+		jail_before = lua_tointeger(L, SIDX_JAIL_BEFORE);
+	if (!lua_isnil(L, SIDX_JAIL_AFTER))
+		jail_after = lua_tointeger(L, SIDX_JAIL_AFTER);
+
+	if (jail_before >= 0 && jail_after >= 0)
+		return luaL_argerror(L, 1, "cannot specify both jail_before and jail_after");
+
+	sigfillset(&default_sigs);
+	sigemptyset(&ignore_sigs);
+	sigemptyset(&block_sigs);
+
+	// If a string, it must be "preserve", already checked above
+	if (lua_type(L, SIDX_SIGNALS) == LUA_TSTRING)
+		spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP | SPAWN_SETSIGMASK);
+	else if (!lua_isnil(L, SIDX_SIGNALS))
+		process_signals(L, SIDX_SIGNALS, &default_sigs, &ignore_sigs, &block_sigs);
+
+	for (int res = 0; res < RLIM_NLIMITS; ++res)
+		rlim_set[res] = false;
+
+	if (!lua_isnil(L, SIDX_RESOURCES))
+		if (process_resources(L, SIDX_RESOURCES, rlim_set, rlim))
+			spawn_attr_flags |= SPAWN_SETRLIMITS_NP;
 
 	lua_settop(L, SIDX__DROP1);
-#undef SIDX__DROP1
 
 	// Note that slots for toclose objects must be allocated in order of
 	// usage.
@@ -1394,10 +1868,10 @@ lspawn_call(lua_State *L)
 	// Reserve another 2 slots for possible FILE* for pipe objects
 	// Slots above that are args/envs first, then other stuff
 
-#define SIDX_ENVT_ITER	(SIDX_SIGNALS + 1)
-#define SIDX_FILE_ACTS	(SIDX_SIGNALS + 2)
-#define SIDX_PIPEOBJS	(SIDX_SIGNALS + 3)
-#define SIDX_ARGBASE	(SIDX_SIGNALS + 5)
+#define SIDX_ENVT_ITER	(SIDX__DROP1 + 1)
+#define SIDX_FILE_ACTS	(SIDX__DROP1 + 2)
+#define SIDX_PIPEOBJS	(SIDX__DROP1 + 3)
+#define SIDX_ARGBASE	(SIDX__DROP1 + 5)
 
 	lua_settop(L, SIDX_ARGBASE-1);
 
@@ -1412,25 +1886,36 @@ lspawn_call(lua_State *L)
 	else
 		search_path = lua_tostring(L, SIDX_SEARCHPATH);
 
-	sigfillset(&default_sigs);
-	sigemptyset(&ignore_sigs);
-	sigemptyset(&block_sigs);
-
-	// If a string, it must be "preserve", already checked above
-	if (lua_type(L, SIDX_SIGNALS) == LUA_TSTRING)
-		spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN | SPAWN_SETSIGMASK);
-	else if (!lua_isnil(L, SIDX_SIGNALS))
-		process_signals(L, SIDX_SIGNALS, &default_sigs, &ignore_sigs, &block_sigs);
-
 	nargs = process_args(L, SIDX_PROGRAM, SIDX_ARGS);
 	nenvs = process_envs(L, SIDX_ENVIRON, SIDX_ENVT_ITER, inherit_env);
 
 	if (nargs + nenvs + 2 > countof(argvec))
-		argv = lua_newuserdata(L, (nargs + nenvs + 2) * sizeof(const char *));
+		argv = lua_newuserdata(L, (unsigned)(nargs + nenvs + 2) * sizeof(const char *));
+
+	vectorize_args(L, argv, SIDX_ARGBASE, nargs, nenvs);
+	if (nenvs >= 0)
+		envp = argv + nargs + 1;
+	else
+		envp = NULL;
 
 	file_acts = lspawn_file_actions_new(L);
 	lua_replace(L, SIDX_FILE_ACTS);
 	make_auto_closevar(L, SIDX_FILE_ACTS);
+
+	if (jail_before >= 0)
+	{
+		err = spawn_file_actions_addjail_np(file_acts, jail_before);
+		if (unlikely(err != 0))
+			return file_act_err(L, err);
+	}
+
+	if (!lua_isnil(L, SIDX_CHROOT_BEFORE))
+	{
+		err = spawn_file_actions_addchroot_np(file_acts,
+											  lua_tostring(L, SIDX_CHROOT_BEFORE));
+		if (unlikely(err != 0))
+			return file_act_err(L, err);
+	}
 
 	if (!lua_isnil(L, SIDX_CHDIR_BEFORE))
 	{
@@ -1445,6 +1930,21 @@ lspawn_call(lua_State *L)
 	else
 		process_files(L, SIDX_FILES, SIDX_PIPEOBJS, file_acts, foreground_fd);
 
+	if (jail_after >= 0)
+	{
+		err = spawn_file_actions_addjail_np(file_acts, jail_after);
+		if (unlikely(err != 0))
+			return file_act_err(L, err);
+	}
+
+	if (!lua_isnil(L, SIDX_CHROOT))
+	{
+		err = spawn_file_actions_addchroot_np(file_acts,
+											  lua_tostring(L, SIDX_CHROOT));
+		if (unlikely(err != 0))
+			return file_act_err(L, err);
+	}
+
 	if (!lua_isnil(L, SIDX_CHDIR))
 	{
 		err = spawn_file_actions_addchdir(file_acts,
@@ -1453,11 +1953,8 @@ lspawn_call(lua_State *L)
 			return file_act_err(L, err);
 	}
 
-	vectorize_args(L, (const char **) argv, SIDX_ARGBASE, nargs, nenvs);
-	if (nenvs >= 0)
-		envp = argv + nargs + 1;
-	else
-		envp = NULL;
+	// No Lua errors after here, so we don't need to worry about
+	// freeing the spawnattr on a nonlocal exit.
 
 	spawnattr_init(&sa);
 	if (spawn_attr_flags & SPAWN_SETPGROUP)
@@ -1465,7 +1962,13 @@ lspawn_call(lua_State *L)
 	spawnattr_setsigdefault(&sa, &default_sigs);
 	spawnattr_setsigignore_np(&sa, &ignore_sigs);
 	spawnattr_setsigmask(&sa, &block_sigs);
+	if (errprefix)
+		spawnattr_seterrprefix_np(&sa, errprefix);
 	spawnattr_setflags(&sa, spawn_attr_flags);
+
+	for (int res = 0; res < RLIM_NLIMITS; ++res)
+		if (rlim_set[res])
+			spawnattr_setrlimit_np(&sa, res, true, &rlim[res]);
 
 	// finally!
 
@@ -1475,8 +1978,8 @@ lspawn_call(lua_State *L)
 				   search_path,
 				   file_acts,
 				   &sa,
-				   argv,
-				   envp);
+				   DECONST(char **, argv),
+				   DECONST(char **, envp));
 		// should never be reached
 		_exit(127);
 	}
@@ -1486,8 +1989,8 @@ lspawn_call(lua_State *L)
 					 search_path,
 					 file_acts,
 					 &sa,
-					 argv,
-					 envp);
+					 DECONST(char **, argv),
+					 DECONST(char **, envp));
 
 	spawnattr_destroy(&sa);
 
@@ -1517,25 +2020,12 @@ lspawn_call(lua_State *L)
 	return 1;
 }
 
-// There may be signals above NSIG; but if so their names are not in
-// sys_signame. Such signals can be referred to only by number or by
-// defintions found elsewhere, e.g. in a POSIX module.
+//==========================================================================
 
-static void
-make_signal_table(lua_State *L)
-{
-	lua_createtable(L, NSIG, NSIG);
-	for (int i = 1; i < NSIG; ++i)
-	{
-		lua_pushfstring(L, "SIG%s", sys_signame[i]);
-		lua_pushvalue(L, -1);
-		lua_pushinteger(L, i);
-		lua_rawset(L, -4);
-		lua_rawseti(L, -2, i);
-	}
-}
+// Library initialization.
 
-EXPORTED
+EXPORTED int luaopen_lspawn(lua_State *);
+
 int
 luaopen_lspawn(lua_State *L)
 {
@@ -1547,9 +2037,10 @@ luaopen_lspawn(lua_State *L)
 	lua_settop(L, 0);
 
 	lua_newtable(L);
+	lspawn_call_init_args(L);
 	lua_pushstring(L, "=");
 	make_signal_table(L);
-	make_metatable(L, &lspawn_lib_meta, 2);
+	make_metatable(L, &lspawn_lib_meta, 3);
 	lua_setmetatable(L, 1);
 
 	luaL_setfuncs(L, lspawn_funcs, 0);

@@ -7,22 +7,26 @@
 
 #include <sys/cdefs.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <stddef.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sched.h>
+#include <stdbool.h>
 
 typedef struct spawnattr		*spawnattr_t;
 typedef struct spawn_file_actions	*spawn_file_actions_t;
 
-#define SPAWN_RESETIDS		0x01
-#define SPAWN_SETPGROUP		0x02
-#define SPAWN_SETSCHEDPARAM	0x04
-#define SPAWN_SETSCHEDULER	0x08
-#define SPAWN_SETSIGDEF		0x10
-#define SPAWN_SETSIGMASK	0x20
-#define SPAWN_SETSID		0x40
-#define SPAWN_SETSIGIGN		0x80
+#define SPAWN_RESETIDS		0x0001
+#define SPAWN_SETPGROUP		0x0002
+#define SPAWN_SETSCHEDPARAM	0x0004
+#define SPAWN_SETSCHEDULER	0x0008
+#define SPAWN_SETSIGDEF		0x0010
+#define SPAWN_SETSIGMASK	0x0020
+#define SPAWN_VERBOSE_NP	0x0100
+#define SPAWN_SETSID_NP		0x0200
+#define SPAWN_SETSIGIGN_NP	0x0400
+#define SPAWN_SETRLIMITS_NP	0x0800
 
 int spawn(pid_t * __restrict, const char * __restrict,
     const spawn_file_actions_t *, const spawnattr_t * __restrict,
@@ -57,7 +61,9 @@ int spawn_file_actions_addclose(spawn_file_actions_t *, int);
 int spawn_file_actions_addclosefrom_np(spawn_file_actions_t *, int);
 int spawn_file_actions_addfchdir(spawn_file_actions_t *, int);
 int spawn_file_actions_addchdir(spawn_file_actions_t *, const char *);
+int spawn_file_actions_addchroot_np(spawn_file_actions_t *, const char *);
 int spawn_file_actions_addsetpgrp_np(spawn_file_actions_t *, int);
+int spawn_file_actions_addjail_np(spawn_file_actions_t *, int);
 
 /*
  * Spawn attributes
@@ -79,6 +85,10 @@ int spawnattr_getsigignore_np(const spawnattr_t * __restrict,
     sigset_t * __restrict);
 int spawnattr_getsigmask(const spawnattr_t * __restrict,
     sigset_t * __restrict sigmask);
+int spawnattr_getrlimit_np(const spawnattr_t * __restrict,
+						   int,
+						   bool * __restrict,
+						   struct rlimit * __restrict);
 
 int spawnattr_setflags(spawnattr_t *, short);
 int spawnattr_setpgroup(spawnattr_t *, pid_t);
@@ -91,5 +101,11 @@ int spawnattr_setsigignore_np(spawnattr_t * __restrict,
     const sigset_t * __restrict);
 int spawnattr_setsigmask(spawnattr_t * __restrict,
     const sigset_t * __restrict);
+int spawnattr_setrlimit_np(spawnattr_t * __restrict,
+						   int,
+						   bool,
+						   const struct rlimit * __restrict);
+int spawnattr_seterrprefix_np(spawnattr_t * __restrict,
+							  const char * __restrict);
 
 #endif

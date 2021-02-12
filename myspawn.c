@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2020 Andrew Gierth <andrew@tao11.riddles.org.uk>
+ * Copyright (c) 2020-2021 Andrew Gierth <andrew@tao11.riddles.org.uk>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -86,6 +86,7 @@
 #include <sys/queue.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
 
@@ -113,14 +114,59 @@ extern int _fcntl(int, int, ...);
 extern int _close(int);
 extern int _closefrom(int);
 extern int _chdir(const char *);
+extern int _chroot(const char *);
 extern int _fchdir(int);
+extern int _jail_attach(int);
 extern int _openat(int, const char *, int, ...);
 extern int _write(int, const void *, __size_t);
+extern int _writev(int, const struct iovec *, int);
 extern int _execve(const char *, char * const *argv, char * const *envp);
+extern int _setrlimit(int rlim, const struct rlimit *val);
 extern int _stat(const char *, struct stat *);
 extern int _waitpid(pid_t, int *, int);
 
 #define STR_WITH_LEN(s_) (s_), sizeof(s_)-1
+
+/* private data structs */
+
+struct spawnattr {
+    short		sa_flags;
+    pid_t		sa_pgroup;
+    int			sa_schedpolicy;
+    sigset_t	sa_sigdefault;
+    sigset_t	sa_sigignore;
+    sigset_t	sa_sigmask;
+    struct sched_param	sa_schedparam;
+	const char *sa_errprefix;
+	struct rlimit sa_rlimits[RLIM_NLIMITS];
+	bool		sa_rlimits_set[RLIM_NLIMITS];
+};
+
+struct spawn_file_actions {
+    STAILQ_HEAD(, spawn_file_actions_entry) fa_list;
+};
+
+typedef struct spawn_file_actions_entry {
+    STAILQ_ENTRY(spawn_file_actions_entry) fae_list;
+    enum {
+		FAE_INVALID,
+		FAE_OPEN,
+		FAE_DUP2,
+		FAE_CLOSE,
+		FAE_CLOSEFROM,
+		FAE_CHROOT,
+		FAE_CHDIR,
+		FAE_FCHDIR,
+		FAE_SETPGRP,
+		FAE_JAIL
+	}			fae_action;
+
+    int			fae_fildes;
+    char	   *fae_path;
+    int			fae_atfd;
+    int			fae_oflag;
+    mode_t		fae_mode;
+} spawn_file_actions_entry_t;
 
 /*
  * We (noinline) most of these because controlling stack usage is more
@@ -175,44 +221,57 @@ get_sigstatus(sigset_t *sigign, sigset_t *sigcatch)
     return 0;
 }
 
-
-struct spawnattr {
-    short		sa_flags;
-    pid_t		sa_pgroup;
-    int			sa_schedpolicy;
-    sigset_t	sa_sigdefault;
-    sigset_t	sa_sigignore;
-    sigset_t	sa_sigmask;
-    struct sched_param	sa_schedparam;
-};
-
-struct spawn_file_actions {
-    STAILQ_HEAD(, spawn_file_actions_entry) fa_list;
-};
-
-typedef struct spawn_file_actions_entry {
-    STAILQ_ENTRY(spawn_file_actions_entry) fae_list;
-    enum {
-		FAE_INVALID,
-		FAE_OPEN,
-		FAE_DUP2,
-		FAE_CLOSE,
-		FAE_CLOSEFROM,
-		FAE_CHDIR,
-		FAE_FCHDIR,
-		FAE_SETPGRP
-	}			fae_action;
-
-    int			fae_fildes;
-    int			fae_atfd;
-    char	   *fae_path;
-    int			fae_oflag;
-    mode_t		fae_mode;
-} spawn_file_actions_entry_t;
-
 /*
  * Spawn routines
  */
+
+struct spawn_args {
+    const char *file;
+    const char *path;
+    const spawn_file_actions_t *fa;
+    const spawnattr_t *sa;
+    char * const * argv;
+    char * const * envp;
+    sigset_t vfmask;
+    bool is_vfork;
+	bool verbose;
+    volatile int error;
+};
+
+__noinline
+static int
+really_report(struct spawn_args *psa, int err, const char *what, const char *arg)
+{
+	const char *estr = err < sys_nerr && sys_errlist[err] ? sys_errlist[err] : "unknown error";
+	size_t estr_len = strlen(estr);
+	static const char *const sep = ": ";
+	static const char *const nel = "\n";
+	const char *errprefix = psa->sa ? (*psa->sa)->sa_errprefix : NULL;
+	struct iovec iov[8] = {
+		{ .iov_base = __DECONST(void *, errprefix), .iov_len = errprefix ? strlen(errprefix) : 0 },
+		{ .iov_base = __DECONST(void *, sep),  .iov_len = 2 },
+		{ .iov_base = __DECONST(void *, what), .iov_len = strlen(what) },
+		{ .iov_base = __DECONST(void *, sep),  .iov_len = 2 },
+		{ .iov_base = __DECONST(void *, arg ? arg : estr), .iov_len = arg ? strlen(arg) : estr_len },
+		{ .iov_base = __DECONST(void *, arg ? sep : nel),  .iov_len = arg ? 2 : 1 },
+		{ .iov_base = __DECONST(void *, estr), .iov_len = estr_len },
+		{ .iov_base = __DECONST(void *, nel), .iov_len = 1 }
+	};
+
+	if (errprefix)
+		(void)_writev(STDERR_FILENO, iov, 6 + (arg ? 2 : 0));
+	else
+		(void)_writev(STDERR_FILENO, iov + 2, 4 + (arg ? 2 : 0));
+	return err;
+}
+
+static int
+report_err(struct spawn_args *psa, int err, const char *what, const char *arg)
+{
+	if (err <= 0 || !psa->verbose)
+		return err;
+	return really_report(psa, err, what, arg);
+}
 
 /*
  * In the vfork case, parent blocked all signals (but we do that again here
@@ -225,42 +284,45 @@ typedef struct spawn_file_actions_entry {
 
 __noinline
 static int
-process_signals_for_vfork(const spawnattr_t *psa, sigset_t *vfmask)
+process_signals_for_vfork(struct spawn_args *psa)
 {
+	const spawnattr_t *sa = psa->sa;
     struct sigaction sigact = { .sa_flags = 0, .sa_handler = SIG_DFL };
     struct sigaction sigiact = { .sa_flags = 0, .sa_handler = SIG_IGN };
     struct sigaction sigoact;
+	sigset_t   *vfmask = &psa->vfmask;
     sigset_t	allsigs;
     sigset_t	sig_was_ignored;
     sigset_t	sig_was_caught;
     bool		sigs_known = false;
 
     sigfillset(&allsigs);
-    __sys_sigprocmask(SIG_SETMASK, &allsigs, NULL);
+    if (__sys_sigprocmask(SIG_SETMASK, &allsigs, NULL) < 0)
+		return report_err(psa, errno, "sigprocmask", NULL);
 
     sigfillset(&sig_was_caught);
     sigfillset(&sig_was_ignored);
     if (get_sigstatus(&sig_was_ignored, &sig_was_caught) == 0)
 		sigs_known = true;
 
-    bool setdefflag = psa && (*psa)->sa_flags & SPAWN_SETSIGDEF;
-    bool setignflag = psa && (*psa)->sa_flags & SPAWN_SETSIGIGN;
+    bool setdefflag = sa && (*sa)->sa_flags & SPAWN_SETSIGDEF;
+    bool setignflag = sa && (*sa)->sa_flags & SPAWN_SETSIGIGN_NP;
 
     for (int sig = 1; sig <= _SIG_MAXSIG; ++sig)
 	{
-		bool setdef = setdefflag && sigismember(&(*psa)->sa_sigdefault, sig);
-		bool setign = setignflag && sigismember(&(*psa)->sa_sigignore, sig);
+		bool setdef = setdefflag && sigismember(&(*sa)->sa_sigdefault, sig);
+		bool setign = setignflag && sigismember(&(*sa)->sa_sigignore, sig);
 		bool was_caught = sigismember(&sig_was_caught, sig);
 		bool was_ignored = sigismember(&sig_was_ignored, sig);
 
 		if (!setdef && !setign)
 		{
-			if (sigs_known && was_caught)
-				setdef = true;
+			if (sigs_known)
+				setdef = was_caught;
 			else
 			{
 				if (__sys_sigaction(sig, NULL, &sigoact) != 0)
-					return errno;
+					return report_err(psa, errno, "sigaction", NULL);
 				if (sigoact.sa_handler != SIG_DFL
 					&& sigoact.sa_handler != SIG_IGN)
 					setdef = true;
@@ -273,18 +335,18 @@ process_signals_for_vfork(const spawnattr_t *psa, sigset_t *vfmask)
 				|| (was_ignored && !sig_ignored_by_default(sig))
 				|| sig == SIGCHLD)
 				if (__sys_sigaction(sig, &sigact, NULL) != 0)
-					return errno;
+					return report_err(psa, errno, "sigaction", NULL);
 		}
 		else if (setign)
 		{
 			if (!sigs_known || was_caught || !was_ignored || sig == SIGCHLD)
 				if (__sys_sigaction(sig, &sigiact, NULL) != 0)
-					return errno;
+					return report_err(psa, errno, "sigaction", NULL);
 		}
     }
 
     if (__sys_sigprocmask(SIG_SETMASK, vfmask, NULL) != 0)
-		return errno;
+		return report_err(psa, errno, "sigprocmask", NULL);
 
     return 0;
 }
@@ -297,8 +359,9 @@ process_signals_for_vfork(const spawnattr_t *psa, sigset_t *vfmask)
  */
 __noinline
 static int
-process_signals_for_rfork(const spawnattr_t sa)
+process_signals_for_rfork(struct spawn_args *psa)
 {
+	const spawnattr_t sa = *(psa->sa);
     struct sigaction sigact = { .sa_flags = 0, .sa_handler = SIG_DFL };
     struct sigaction sigiact = { .sa_flags = 0, .sa_handler = SIG_IGN };
     sigset_t	sig_was_ignored;
@@ -306,16 +369,16 @@ process_signals_for_rfork(const spawnattr_t sa)
 
     if (sa->sa_flags & SPAWN_SETSIGMASK)
 		if (__sys_sigprocmask(SIG_SETMASK, &sa->sa_sigmask, NULL) != 0)
-			return errno;
+			return report_err(psa, errno, "sigprocmask", NULL);
 
     sigfillset(&sig_was_ignored);
     if (get_sigstatus(&sig_was_ignored, NULL) == 0)
 		sigs_known = true;
 
-    if (sa->sa_flags & (SPAWN_SETSIGDEF | SPAWN_SETSIGIGN))
+    if (sa->sa_flags & (SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP))
 	{
 		bool setdefflag = sa->sa_flags & SPAWN_SETSIGDEF;
-		bool setignflag = sa->sa_flags & SPAWN_SETSIGIGN;
+		bool setignflag = sa->sa_flags & SPAWN_SETSIGIGN_NP;
 
 		for (int sig = 1; sig <= _SIG_MAXSIG; ++sig)
 		{
@@ -325,13 +388,13 @@ process_signals_for_rfork(const spawnattr_t sa)
 					|| sig == SIGCHLD
 					|| (!sig_ignored_by_default(sig) && sigismember(&sig_was_ignored, sig)))
 					if (__sys_sigaction(sig, &sigact, NULL) != 0)
-						return errno;
+						return report_err(psa, errno, "sigaction", NULL);
 			}
 			else if (setignflag && sigismember(&sa->sa_sigignore, sig))
 			{
 				if (!sigs_known || sig == SIGCHLD || !sigismember(&sig_was_ignored, sig))
 					if (__sys_sigaction(sig, &sigiact, NULL) != 0)
-						return errno;
+						return report_err(psa, errno, "sigaction", NULL);
 			}
 		}
     }
@@ -340,17 +403,19 @@ process_signals_for_rfork(const spawnattr_t sa)
 }
 
 static int
-process_spawnattr(const spawnattr_t sa)
+process_spawnattr(struct spawn_args *psa)
 {
+	const spawnattr_t sa = *(psa->sa);
+
     /* Set session */
-    if (sa->sa_flags & SPAWN_SETSID)
+    if (sa->sa_flags & SPAWN_SETSID_NP)
 		if (setsid() != 0)
-			return errno;
+			return report_err(psa, errno, "setsid", NULL);
 
     /* Set process group */
     if (sa->sa_flags & SPAWN_SETPGROUP)
 		if (setpgid(0, sa->sa_pgroup) != 0)
-			return errno;
+			return report_err(psa, errno, "setpgid", NULL);
 
     /* Set scheduler policy */
     if (sa->sa_flags & SPAWN_SETSCHEDULER)
@@ -358,28 +423,42 @@ process_spawnattr(const spawnattr_t sa)
 		if (sched_setscheduler(0,
 							   sa->sa_schedpolicy,
 							   &sa->sa_schedparam) != 0)
-			return errno;
+			return report_err(psa, errno, "sched_setscheduler", NULL);
     }
 	else if (sa->sa_flags & SPAWN_SETSCHEDPARAM)
 	{
 		if (sched_setparam(0, &sa->sa_schedparam) != 0)
-			return errno;
+			return report_err(psa, errno, "sched_setparam", NULL);
     }
+
+	/* Set resources */
+	if (sa->sa_flags & SPAWN_SETRLIMITS_NP)
+	{
+		for (int res = 0; res < RLIM_NLIMITS; ++res)
+		{
+			if (sa->sa_rlimits_set[res])
+			{
+				if (_setrlimit(res, &sa->sa_rlimits[res]) < 0)
+					return report_err(psa, errno, "setrlimit", NULL);
+			}
+		}
+	}
 
     /* Reset user ID's */
     if (sa->sa_flags & SPAWN_RESETIDS)
 	{
 		if (setgid(getgid()) != 0)
-			return errno;
+			return report_err(psa, errno, "setgid", NULL);
 		if (setuid(getuid()) != 0)
-			return errno;
+			return report_err(psa, errno, "setuid", NULL);
     }
 
     return 0;
 }
 
 static int
-process_file_actions_entry(spawn_file_actions_entry_t *fae)
+process_file_actions_entry(struct spawn_args *psa,
+						   spawn_file_actions_entry_t *fae)
 {
     int			fd;
 
@@ -392,7 +471,7 @@ process_file_actions_entry(spawn_file_actions_entry_t *fae)
 						 fae->fae_oflag,
 						 fae->fae_mode);
 			if (fd < 0)
-				return errno;
+				return report_err(psa, errno, "openat", fae->fae_path);
 
 			if (fd != fae->fae_fildes)
 			{
@@ -404,11 +483,11 @@ process_file_actions_entry(spawn_file_actions_entry_t *fae)
 				{
 					int saved_errno = errno;
 					(void)_close(fd);
-					return saved_errno;
+					return report_err(psa, saved_errno, "fcntl(dup for open)", NULL);
 				}
 				if (_close(fd) != 0)
 					if (errno == EBADF)
-						return EBADF;
+						return report_err(psa, EBADF, "close", NULL);
 			}
 			return 0;
 
@@ -420,10 +499,10 @@ process_file_actions_entry(spawn_file_actions_entry_t *fae)
 			if (fae->fae_atfd != fae->fae_fildes)
 			{
 				if (_fcntl(fae->fae_atfd, F_DUP2FD, fae->fae_fildes) < 0)
-					return errno;
+					return report_err(psa, errno, "fcntl(DUP2)", NULL);
 			}
 			else if (_fcntl(fae->fae_fildes, F_SETFD, 0) < 0)
-				return errno;
+				return report_err(psa, errno, "fcntl(SETFD)", NULL);
 			return 0;
 
 		case FAE_CLOSE:
@@ -436,16 +515,28 @@ process_file_actions_entry(spawn_file_actions_entry_t *fae)
 			(void)_closefrom(fae->fae_fildes);
 			return 0;
 
+		case FAE_CHROOT:
+			/* Perform a chroot() */
+			if (_chroot(fae->fae_path) < 0)
+				return report_err(psa, errno, "chroot", fae->fae_path);
+			return 0;
+
 		case FAE_CHDIR:
 			/* Perform a chdir() */
 			if (_chdir(fae->fae_path) < 0)
-				return errno;
+				return report_err(psa, errno, "chdir", fae->fae_path);
 			return 0;
 
 		case FAE_FCHDIR:
 			/* Perform an fchdir() */
 			if (_fchdir(fae->fae_fildes) < 0)
-				return errno;
+				return report_err(psa, errno, "fchdir", NULL);
+			return 0;
+
+		case FAE_JAIL:
+			/* Perform a jail_attach() */
+			if (_jail_attach(fae->fae_fildes) < 0)
+				return report_err(psa, errno, "jail_attach", NULL);
 			return 0;
 
 		case FAE_SETPGRP: 			/* Perform a tcsetpgrp() */
@@ -460,29 +551,30 @@ process_file_actions_entry(spawn_file_actions_entry_t *fae)
 			sigemptyset(&sigs);
 			sigaddset(&sigs, SIGTTOU);
 			if (__sys_sigprocmask(SIG_BLOCK, &sigs, &osigs) < 0)
-				return errno;
+				return report_err(psa, errno, "sigprocmask(block TTOU)", NULL);
 			if (tcsetpgrp(fae->fae_fildes, getpgrp()) < 0)
-				return errno;
+				return report_err(psa, errno, "tcsetpgrp", NULL);
 			if (__sys_sigprocmask(SIG_SETMASK, &osigs, NULL) < 0)
-				return errno;
+				return report_err(psa, errno, "sigprocmask(restore TTOU)", NULL);
 			return 0;
 		}
 
 		default:
-			return EINVAL;
+			return report_err(psa, EINVAL, "process_file_action", NULL);
     }
 }
 
 __noinline
 static int
-process_file_actions(const spawn_file_actions_t fa)
+process_file_actions(struct spawn_args *psa)
 {
+	const spawn_file_actions_t fa = *psa->fa;
     spawn_file_actions_entry_t *fae;
 
     /* Replay all file descriptor modifications */
     STAILQ_FOREACH(fae, &fa->fa_list, fae_list)
 	{
-		int	error = process_file_actions_entry(fae);
+		int	error = process_file_actions_entry(psa, fae);
 		if (error)
 			return error;
 	}
@@ -636,7 +728,7 @@ execvPe(const char *name,
 		}
 		else
 			/* Standard non-empty component. */
-			pathlen = delim - pathptr;
+			pathlen = (size_t)(delim - pathptr);
 
 		/*
 		 * If the path is too long complain.  This is a possible
@@ -664,18 +756,6 @@ execvPe(const char *name,
 }
 
 
-struct spawn_args {
-    const char *file;
-    const char *path;
-    const spawn_file_actions_t *fa;
-    const spawnattr_t *sa;
-    char * const * argv;
-    char * const * envp;
-    sigset_t vfmask;
-    bool is_vfork;
-	bool verbose;
-    volatile int error;
-};
 
 #if defined(__i386__) || defined(__amd64__)
 /*
@@ -683,7 +763,7 @@ struct spawn_args {
  * function calls without large local vars; add a moderate amount of slop plus
  * the size of the largest large stack var we will use.
  */
-#define	_RFORK_THREAD_STACK_SIZE \
+#define	RFORK_THREAD_STACK_SIZE \
 	(MINSIGSTKSZ + 512 + MAX(PATH_MAX, KINFO_PROC_SIZE))
 #endif
 
@@ -696,15 +776,15 @@ _spawn_thr(void *data)
     psa = data;
 
     if (psa->is_vfork)
-		err = process_signals_for_vfork(psa->sa, &psa->vfmask);
+		err = process_signals_for_vfork(psa);
     else if (psa->sa != NULL)
-		err = process_signals_for_rfork(*psa->sa);
+		err = process_signals_for_rfork(psa);
 
     if (!err && psa->sa != NULL)
-		err = process_spawnattr(*psa->sa);
+		err = process_spawnattr(psa);
 
     if (!err && psa->fa != NULL)
-		err = process_file_actions(*psa->fa);
+		err = process_file_actions(psa);
 
 	if (!err)
 	{
@@ -712,13 +792,13 @@ _spawn_thr(void *data)
 			execvPe(psa->file, psa->path, psa->argv, psa->envp);
 		else
 			_execve(psa->file, psa->argv, psa->envp);
-		err = errno;
+		err = report_err(psa, errno, psa->path ? "execvPe" : "_execve", psa->file);
 	}
 
 	psa->error = err;
 
 	if (psa->verbose)
-		warnc(err, "spawnexec failed");
+		report_err(psa, err, "spawn failed", NULL);
 
     /* This is called in such a way that it must not exit. */
     _exit(127);
@@ -737,12 +817,11 @@ spawnP(pid_t *pidp,
 	sigset_t	allsigs;
 	sigset_t	oldsigs;
 	pid_t		pid;
-#ifdef _RFORK_THREAD_STACK_SIZE
+#ifdef RFORK_THREAD_STACK_SIZE
 	char	   *stack;
 	size_t		stacksz;
-	int			error;
 
-	stacksz = _RFORK_THREAD_STACK_SIZE;
+	stacksz = RFORK_THREAD_STACK_SIZE;
 	if (path)
 	    for (size_t argc = 0; argv[argc] != NULL; ++argc)
 			stacksz += sizeof(char *);
@@ -763,7 +842,7 @@ spawnP(pid_t *pidp,
 	psa.envp = envp ? envp : environ;
 	psa.path = path;
 	psa.is_vfork = false;
-	psa.verbose = false;
+	psa.verbose = sa && (*sa)->sa_flags & SPAWN_VERBOSE_NP;
 	psa.error = 0;
 
 	/*
@@ -773,19 +852,21 @@ spawnP(pid_t *pidp,
 	 * happen with newer libc on older kernel that doesn't accept
 	 * RFSPAWN.
 	 */
-#ifdef _RFORK_THREAD_STACK_SIZE
+#ifdef RFORK_THREAD_STACK_SIZE
 	/*
 	 * x86 stores the return address on the stack, so rfork(2) cannot work
 	 * as-is because the child would clobber the return address om the
 	 * parent.  Because of this, we must use rfork_thread instead while
 	 * almost every other arch stores the return address in a register.
 	 */
-	pid = rfork_thread(RFSPAWN, stack + stacksz, _spawn_thr, &psa);
-	error = errno;
-	free(stack);
-	errno = error;
+	pid = rfork_thread((int)RFSPAWN, stack + stacksz, _spawn_thr, &psa);
+	{
+		int save_errno = errno;
+		free(stack);
+		errno = save_errno;
+	}
 #else
-	pid = rfork(RFSPAWN);
+	pid = rfork((int)RFSPAWN);
 	if (pid == 0)
 		/* _spawn_thr does not return */
 		_spawn_thr(&psa);
@@ -902,7 +983,10 @@ suspend_threads_the_hard_way(void)
                 }
                 map = map->l_next;
                 if (!map)
-                    map = pmap, pmap = NULL;
+				{
+                    map = pmap;
+					pmap = NULL;
+				}
             }
         }
     }
@@ -944,7 +1028,7 @@ spawnexecP(const char *file,
 	psa.envp = envp ? envp : environ;
 	psa.path = path;
 	psa.error = 0;
-	psa.verbose = true;
+	psa.verbose = !sa || (*sa)->sa_flags & SPAWN_VERBOSE_NP;
 
 	/* Pretend we did a vfork. */
 	psa.is_vfork = true;
@@ -1024,45 +1108,47 @@ spawn_file_actions_destroy(spawn_file_actions_t *fa)
 		STAILQ_REMOVE_HEAD(&(*fa)->fa_list, fae_list);
 
 		/* Deallocate file action entry */
-		if (fae->fae_path)
-			free(fae->fae_path);
 		free(fae);
     }
 
     free(*fa);
+	*fa = NULL;
     return 0;
 }
 
-static spawn_file_actions_entry_t *
+
+static int
 alloc_action(spawn_file_actions_t * __restrict fa,
+			 spawn_file_actions_entry_t * __restrict fae_in,
 			 const char * __restrict path,
-			 int * __restrict error)
+			 bool have_path)
 {
     spawn_file_actions_entry_t *fae;
-    char *npath = NULL;
+	size_t plen = 0;
 
-    if (path)
-	{
-		npath = strdup(path);
-		if (npath == NULL)
-		{
-			*error = errno;
-			return NULL;
-		}
-    }
-    fae = malloc(sizeof(spawn_file_actions_entry_t));
+	if (have_path)
+		plen = strlen(path) + 1;
+
+    fae = malloc(sizeof(spawn_file_actions_entry_t) + plen);
     if (fae == NULL)
+		return errno;
+
+	*fae = *fae_in;
+	if (have_path)
 	{
-		*error = errno;
-		if (npath)
-			free(npath);
-		return NULL;
-    }
-    fae->fae_action = FAE_INVALID;
-    fae->fae_path = npath;
-    STAILQ_INSERT_TAIL(&(*fa)->fa_list, fae, fae_list);
-    return fae;
+		char *npath = (char *)(fae + 1);
+		memcpy(npath, path, plen);
+		fae->fae_path = npath;
+	}
+	else
+		fae->fae_path = NULL;
+
+	STAILQ_INSERT_TAIL(&(*fa)->fa_list, fae, fae_list);
+    return 0;
 }
+
+#define FAE_ALLOC(fa_,...) alloc_action(fa_, &((spawn_file_actions_entry_t){ __VA_ARGS__ }), NULL, false)
+#define FAE_ALLOC_PATH(fa_,path_,...) alloc_action(fa_, &((spawn_file_actions_entry_t){ __VA_ARGS__ }), (path_), true)
 
 int
 spawn_file_actions_addopen(spawn_file_actions_t * __restrict fa,
@@ -1071,39 +1157,34 @@ spawn_file_actions_addopen(spawn_file_actions_t * __restrict fa,
 						   int oflag,
 						   mode_t mode)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, path, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_OPEN;
-    fae->fae_fildes = fildes;
-    fae->fae_atfd = AT_FDCWD;
-    fae->fae_oflag = oflag;
-    fae->fae_mode = mode;
-    return 0;
+	return FAE_ALLOC_PATH(fa, path,
+						  .fae_action	= FAE_OPEN,
+						  .fae_fildes	= fildes,
+						  .fae_atfd		= AT_FDCWD,
+						  .fae_oflag	= oflag,
+						  .fae_mode		= mode
+		);
 }
 
 int
 spawn_file_actions_addchdir(spawn_file_actions_t * __restrict fa,
 							const char * __restrict path)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
+	return FAE_ALLOC_PATH(fa, path,
+						  .fae_action	= FAE_CHDIR
+		);
+}
 
-    /* Allocate object */
-    fae = alloc_action(fa, path, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_CHDIR;
-    return 0;
+int
+spawn_file_actions_addchroot_np(spawn_file_actions_t * __restrict fa,
+								const char * __restrict path)
+{
+	return FAE_ALLOC_PATH(fa, path,
+						  .fae_action	= FAE_CHROOT
+		);
 }
 
 int
@@ -1114,23 +1195,16 @@ spawn_file_actions_addopenat_np(spawn_file_actions_t * __restrict fa,
 								int oflag,
 								mode_t mode)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0 || (atfd < 0 && atfd != AT_FDCWD))
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, path, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_OPEN;
-    fae->fae_fildes = fildes;
-    fae->fae_atfd = atfd;
-    fae->fae_oflag = oflag;
-    fae->fae_mode = mode;
-    return 0;
+	return FAE_ALLOC_PATH(fa, path,
+						  .fae_action	= FAE_OPEN,
+						  .fae_fildes	= fildes,
+						  .fae_atfd		= atfd,
+						  .fae_oflag	= oflag,
+						  .fae_mode		= mode
+		);
 }
 
 int
@@ -1138,102 +1212,79 @@ spawn_file_actions_adddup2(spawn_file_actions_t *fa,
 						   int fildes,
 						   int newfildes)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0 || newfildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, NULL, &error);
-    if (fae == NULL)
-		return error;
-
-    /* Set values and store in queue */
-    fae->fae_action = FAE_DUP2;
-    fae->fae_fildes = newfildes;
-    fae->fae_atfd = fildes;
-    return 0;
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_DUP2,
+					 .fae_fildes	= newfildes,
+					 .fae_atfd		= fildes
+		);
 }
 
 int
 spawn_file_actions_addclose(spawn_file_actions_t *fa,
 							int fildes)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, NULL, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_CLOSE;
-    fae->fae_fildes = fildes;
-    return 0;
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_CLOSE,
+					 .fae_fildes	= fildes
+		);
 }
 
 int
 spawn_file_actions_addfchdir(spawn_file_actions_t *fa,
 							 int fildes)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, NULL, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_FCHDIR;
-    fae->fae_fildes = fildes;
-    return 0;
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_FCHDIR,
+					 .fae_fildes	= fildes
+		);
 }
 
 int
 spawn_file_actions_addsetpgrp_np(spawn_file_actions_t *fa,
 								 int fildes)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, NULL, &error);
-    if (fae == NULL)
-		return error;
-
-    fae->fae_action = FAE_SETPGRP;
-    fae->fae_fildes = fildes;
-    return 0;
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_SETPGRP,
+					 .fae_fildes	= fildes
+		);
 }
 
 int
 spawn_file_actions_addclosefrom_np(spawn_file_actions_t *fa,
 								   int fildes)
 {
-    spawn_file_actions_entry_t *fae;
-    int error;
-
     if (fildes < 0)
 		return EBADF;
 
-    /* Allocate object */
-    fae = alloc_action(fa, NULL, &error);
-    if (fae == NULL)
-		return error;
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_CLOSEFROM,
+					 .fae_fildes	= fildes
+		);
+}
 
-    fae->fae_action = FAE_CLOSEFROM;
-    fae->fae_fildes = fildes;
-    return 0;
+int
+spawn_file_actions_addjail_np(spawn_file_actions_t *fa,
+							  int jailid)
+{
+    if (jailid < 0)
+		return EINVAL;
+
+	return FAE_ALLOC(fa,
+					 .fae_action	= FAE_JAIL,
+					 .fae_fildes	= jailid
+		);
 }
 
 /*
@@ -1243,13 +1294,15 @@ spawn_file_actions_addclosefrom_np(spawn_file_actions_t *fa,
 int
 spawnattr_init(spawnattr_t *ret)
 {
+	static const struct spawnattr nullsa;
 	spawnattr_t sa;
 
-	sa = calloc(1, sizeof(struct spawnattr));
+	sa = malloc(sizeof(struct spawnattr));
 	if (sa == NULL)
 		return errno;
 
 	/* Set defaults as specified by POSIX, cleared above */
+	*sa = nullsa;
 	*ret = sa;
 	return 0;
 }
@@ -1257,7 +1310,10 @@ spawnattr_init(spawnattr_t *ret)
 int
 spawnattr_destroy(spawnattr_t *sa)
 {
+	if ((*sa)->sa_errprefix)
+		free(__DECONST(void *, (*sa)->sa_errprefix));
 	free(*sa);
+	*sa = NULL;
 	return 0;
 }
 
@@ -1302,10 +1358,31 @@ spawnattr_getsigdefault(const spawnattr_t * __restrict sa,
 }
 
 int
+spawnattr_getsigignore_np(const spawnattr_t * __restrict sa,
+						  sigset_t * __restrict sigignore)
+{
+	*sigignore = (*sa)->sa_sigignore;
+	return 0;
+}
+
+int
 spawnattr_getsigmask(const spawnattr_t * __restrict sa,
 					 sigset_t * __restrict sigmask)
 {
 	*sigmask = (*sa)->sa_sigmask;
+	return 0;
+}
+
+int
+spawnattr_getrlimit_np(const spawnattr_t * __restrict sa,
+					int rlim,
+					bool * __restrict isset,
+					struct rlimit * __restrict val)
+{
+	if (rlim < 0 || rlim >= RLIM_NLIMITS)
+		return EINVAL;
+	*isset = (*sa)->sa_rlimits_set[rlim];
+	*val = (*sa)->sa_rlimits[rlim];
 	return 0;
 }
 
@@ -1359,5 +1436,26 @@ spawnattr_setsigmask(spawnattr_t * __restrict sa,
 					 const sigset_t * __restrict sigmask)
 {
 	(*sa)->sa_sigmask = *sigmask;
+	return 0;
+}
+
+int
+spawnattr_setrlimit_np(spawnattr_t * __restrict sa,
+					   int rlim,
+					   bool isset,
+					   const struct rlimit * __restrict val)
+{
+	if (rlim < 0 || rlim >= RLIM_NLIMITS)
+		return EINVAL;
+	(*sa)->sa_rlimits_set[rlim] = isset;
+	(*sa)->sa_rlimits[rlim] = *val;
+	return 0;
+}
+
+int
+spawnattr_seterrprefix_np(spawnattr_t * __restrict sa,
+						  const char * __restrict pfx)
+{
+	(*sa)->sa_errprefix = strdup(pfx);
 	return 0;
 }
