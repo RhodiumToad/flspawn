@@ -1788,7 +1788,7 @@ lspawn_call(lua_State *L)
 	const char **envp;
 
 	pid_t		child_pid;
-	int			err;
+	int			err = 0;
 
 	// We might push a bunch of things for args, env vars, etc. We aim to keep
 	// 63 free slots minimum, and check for extension in indefinite loops
@@ -1989,16 +1989,16 @@ lspawn_call(lua_State *L)
 	spawnattr_setsigignore_np(&sa, &ignore_sigs);
 	spawnattr_setsigmask(&sa, &block_sigs);
 	if (errprefix)
-		spawnattr_seterrprefix_np(&sa, errprefix);
+		err = spawnattr_seterrprefix_np(&sa, errprefix);
 	spawnattr_setflags(&sa, spawn_attr_flags);
 
 	for (int res = 0; res < RLIM_NLIMITS; ++res)
-		if (rlim_set[res])
-			spawnattr_setrlimit_np(&sa, res, true, &rlim[res]);
+		if (err == 0 && rlim_set[res])
+			err = spawnattr_setrlimit_np(&sa, res, true, &rlim[res]);
 
 	// finally!
 
-	if (do_exec)
+	if (do_exec && err == 0)
 	{
 		spawnexecP(filename,
 				   search_path,
@@ -2009,7 +2009,7 @@ lspawn_call(lua_State *L)
 		// should never be reached
 		_exit(127);
 	}
-	else
+	else if (err == 0)
 		err = spawnP(&child_pid,
 					 filename,
 					 search_path,
@@ -2019,6 +2019,8 @@ lspawn_call(lua_State *L)
 					 DECONST(char **, envp));
 
 	spawnattr_destroy(&sa);
+
+	// Lua errors can happen again now.
 
 	auto_closevar_compat(L, SIDX_PIPEOBJS+1);
 	auto_closevar_compat(L, SIDX_FILE_ACTS);
