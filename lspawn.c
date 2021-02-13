@@ -79,10 +79,12 @@ is_container(lua_State *L, int nd)
 		lua_pop(L, 1);
 		return true;
 	}
-	if (lua_type(L, nd) == LUA_TTABLE
-		&& luaL_getmetafield(L, nd, "__index") == LUA_TNIL)
-		return true;
-	lua_pop(L, 1);
+	if (lua_type(L, nd) == LUA_TTABLE)
+	{
+		if (luaL_getmetafield(L, nd, "__index") == LUA_TNIL)
+			return true;
+		lua_pop(L, 1);
+	}
 	return false;
 }
 
@@ -659,8 +661,7 @@ process_files(lua_State *L,
 	hiwat_in = hiwat_out;
 
 	// For each output fd, find its input fd and build the out->in map. Find
-	// the input high-water-mark in the process. Also count how many stack
-	// slots we'll need for "open" call filenames, while we're here.
+	// the input high-water-mark in the process.
 
 	for (int i = 0; i <= hiwat_out; ++i)
 	{
@@ -723,8 +724,7 @@ process_files(lua_State *L,
 			fd_in = i;
 		if (fd_in >= 0)
 		{
-			int fdflags;
-			if (fcntl(fd_in, F_GETFD, &fdflags) < 0)
+			if (fcntl(fd_in, F_GETFD, 0) == -1)
 				return luaL_argerror(L, 1, "bad entry in files table, file not open");
 			if (fd_in > hiwat_in)
 				hiwat_in = fd_in;
@@ -1010,6 +1010,8 @@ process_args(lua_State *L, int cmd_idx, int argt_idx)
 // slate, otherwise keep vars from the existing env (pushed as lightudata to
 // avoid overhead of interning strings).
 //
+// Note that we may clobber the envt_idx stack slot with a temp copy.
+//
 
 static int
 process_envs(lua_State *L, int envt_idx, int iter_idx, bool inherit)
@@ -1022,6 +1024,24 @@ process_envs(lua_State *L, int envt_idx, int iter_idx, bool inherit)
 
 	if (inherit && environ)
 	{
+		// envt_idx has already been checked for container-ness
+		if (luaL_getmetafield(L, envt_idx, "__pairs") != LUA_TNIL)
+		{
+			lua_pop(L, 1);
+			lua_createtable(L, 0, 64);
+			int tmp_idx = lua_absindex(L, -1);
+
+			bool metaloop = pairs_start(L, envt_idx, iter_idx, true);
+
+			while (metaloop ? pairs_next(L) : lua_next(L, envt_idx))
+			{
+				lua_pushvalue(L, -2);
+				lua_insert(L, -2);
+				lua_rawset(L, tmp_idx);
+			}
+
+			lua_replace(L, envt_idx);
+		}
 		for (int i = 0; environ[i]; ++i)
 		{
 			const char *name = environ[i];
@@ -1309,16 +1329,16 @@ rv_from_string(lua_State *L,
 
 	if (endptr != ptr && errno == 0)
 	{
-		if (func)
+		if (func && *endptr != 0)
 			valid = func(endptr, &mult);
-		else
+		else if (*endptr == 0)
 			valid = true;
 	}
 
 	sz = u64_mul(L, sz, mult);
 
 	if (!valid || sz > INT64_MAX || (rlim_t)sz == RLIM_INFINITY)
-		luaL_error(L, "invalid resource limit size");
+		luaL_error(L, "invalid resource limit value");
 
 	return (rlim_t) sz;
 }
@@ -1534,7 +1554,7 @@ static RegMeta lspawn_lib_meta = {
 //
 // spawn {
 //   exec = boolean,        -- if true, exec() the process (no return)
-//   errprefix = string,    -- prefix for verbose errors
+//   verbose = string,      -- prefix for verbose errors
 //   program = string,		-- required; filename of executable
 //   args = table,			-- optional: argument strings
 //   environ = table,       -- optional: { NAME = string, ... }
@@ -1782,8 +1802,9 @@ lspawn_call(lua_State *L)
 	if (verify_object_exact(L, 1, &lspawn_lib_meta))
 		lua_remove(L, 1);
 
-	// Allow simplified call style of spawn(prog,arg,...) by converting it
-	// to the full table form; prog must be a string.
+	// Allow simplified call style of spawn(prog,arg,...) by converting it to
+	// the full table form; prog must be a string. We assume that simpified
+	// form wants a path search.
 	switch (lua_type(L, 1))
 	{
 		case LUA_TSTRING:
@@ -1802,9 +1823,14 @@ lspawn_call(lua_State *L)
 			lua_insert(L, 1);
 			lua_setfield(L, 1, "program");
 			lua_setfield(L, 1, "args");
+			lua_pushboolean(L, 1);
+			lua_setfield(L, 1, "search_path");
+			lua_settop(L, 1);
 			break;
 		}
 		case LUA_TTABLE:
+			if (lua_gettop(L) > 1)
+				return luaL_argerror(L, 2, "only one argument expected");
 			break;
 		default:
 			return luaL_argerror(L, 1, "expected table or string");
