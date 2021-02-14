@@ -859,9 +859,9 @@ process_files(lua_State *L,
 				lua_pop(L, 1);
 				break;
 			}
+
 			case FA_COPY_FROM:
-				err = spawn_file_actions_adddup2(facts, foreground_fd, p->value1);
-				break;
+				return luaL_argerror(L, 1, "foreground_tty must not refer to a copy_from");
 		}
 		if (unlikely(err != 0))
 			return file_act_err(L, err);
@@ -935,11 +935,30 @@ process_files(lua_State *L,
 				break;
 			}
 			case FA_COPY_FROM:
-				err = spawn_file_actions_adddup2(facts, i, p->value1);
+				err = 0;
 				break;
 		}
 		if (unlikely(err != 0))
 			return file_act_err(L, err);
+
+		lua_pop(L, 1);
+	}
+
+	for (int i = 0; i <= hiwat_out; ++i)
+	{
+		struct lspawn_fa_data *p = NULL;
+		if (i == foreground_fd)
+			continue;
+		if (lua_rawgeti(L, ftab_idx, i) == LUA_TUSERDATA)
+		{
+			p = to_object(L, -1, &lspawn_file_action_meta);
+			if (p && p->type == FA_COPY_FROM)
+			{
+				err = spawn_file_actions_adddup2(facts, p->value1, 1);
+				if (unlikely(err != 0))
+					return file_act_err(L, err);
+			}
+		}
 
 		lua_pop(L, 1);
 	}
