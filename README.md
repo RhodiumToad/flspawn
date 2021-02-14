@@ -42,37 +42,37 @@ General usage
 
 General usage is as follows:
 
-	pid,err_or_pipe,errno =
-		spawn {
-			exec = bool,
-			verbose = label,
-			program = "prog",			-- required
-			args = {...},
-			environ = {...},
-			files = {
-				[n] = action, ...
-			},
-			directory = "dir",
-			directory_before = "dir",
-			chroot = "dir",
-			chroot_before = "dir",
-			search_path = path,
-			signals = {
-				ignore = {...},
-				block = {...},
-				preserve = {...}
-			},
-			resources = {
-				name = limit, ...
-			},
-			reset_ids = bool,
-			new_session = bool,
-			process_group = pgrp,
-			foreground_tty = ttyfd,
-			clean_environ = bool,
-			jail_before = jid,
-			jail_after = jid
-		}
+    pid,err_or_pipe,errno =
+        spawn {
+            exec = bool,
+            verbose = label,
+            program = "prog",           -- required
+            args = {...},
+            environ = {...},
+            files = {
+                [n] = action, ...
+            },
+            directory = "dir",
+            directory_before = "dir",
+            chroot = "dir",
+            chroot_before = "dir",
+            search_path = path,
+            signals = {
+                ignore = {...},
+                block = {...},
+                preserve = {...}
+            },
+            resources = {
+                name = limit, ...
+            },
+            reset_ids = bool,
+            new_session = bool,
+            process_group = pgrp,
+            foreground_tty = ttyfd,
+            clean_environ = bool,
+            jail_before = jid,
+            jail_after = jid
+        }
 
 All arguments except `program` are optional.
 
@@ -95,7 +95,12 @@ All arguments except `program` are optional.
     path or is relative to the current directory. If `search_path` is
     set and `program` is not absolute, it is searched for in the
     applicable path.
-	
+
+    Note that all file and directory actions, including all jail and
+    chroot operations, are performed before the program is searched
+    for, so any specified paths must be resolvable within the final
+    root and current directories.
+
   * `args` (sequence of string or number values) specifies the
     arguments to the program. `argv[0]` defaults to `program` but may
     be overridden by an `[0] =` entry in `args`.
