@@ -23,10 +23,11 @@ typedef struct spawn_file_actions	*spawn_file_actions_t;
 #define SPAWN_SETSCHEDULER	0x0008
 #define SPAWN_SETSIGDEF		0x0010
 #define SPAWN_SETSIGMASK	0x0020
-#define SPAWN_VERBOSE_NP	0x0100
-#define SPAWN_SETSID_NP		0x0200
-#define SPAWN_SETSIGIGN_NP	0x0400
-#define SPAWN_SETRLIMITS_NP	0x0800
+#define SPAWN_SETSID		0x0040
+/* non-POSIX extensions */
+#define SPAWN_SETSIGIGN_NP	0x2000
+#define SPAWN_SETRLIMITS_NP	0x4000
+#define SPAWN_VERBOSE_NP	((short)0x8000U)
 
 int spawn(pid_t * __restrict, const char * __restrict,
     const spawn_file_actions_t *, const spawnattr_t * __restrict,
@@ -53,14 +54,15 @@ int spawn_file_actions_destroy(spawn_file_actions_t *);
 
 int spawn_file_actions_addopen(spawn_file_actions_t * __restrict,
     int, const char * __restrict, int, mode_t);
+int spawn_file_actions_adddup2(spawn_file_actions_t *, int, int);
+int spawn_file_actions_addclose(spawn_file_actions_t *, int);
+int spawn_file_actions_addfchdir(spawn_file_actions_t *, int);
+int spawn_file_actions_addchdir(spawn_file_actions_t *, const char *);
+/* non-POSIX extensions */
 int spawn_file_actions_addopenat_np(spawn_file_actions_t * __restrict,
 				    int, int, const char * __restrict,
 				    int, mode_t);
-int spawn_file_actions_adddup2(spawn_file_actions_t *, int, int);
-int spawn_file_actions_addclose(spawn_file_actions_t *, int);
 int spawn_file_actions_addclosefrom_np(spawn_file_actions_t *, int);
-int spawn_file_actions_addfchdir(spawn_file_actions_t *, int);
-int spawn_file_actions_addchdir(spawn_file_actions_t *, const char *);
 int spawn_file_actions_addchroot_np(spawn_file_actions_t *, const char *);
 int spawn_file_actions_addsetpgrp_np(spawn_file_actions_t *, int);
 int spawn_file_actions_addjail_np(spawn_file_actions_t *, int);
@@ -81,10 +83,11 @@ int spawnattr_getschedpolicy(const spawnattr_t * __restrict,
     int * __restrict);
 int spawnattr_getsigdefault(const spawnattr_t * __restrict,
     sigset_t * __restrict);
-int spawnattr_getsigignore_np(const spawnattr_t * __restrict,
-    sigset_t * __restrict);
 int spawnattr_getsigmask(const spawnattr_t * __restrict,
     sigset_t * __restrict sigmask);
+/* non-POSIX extensions */
+int spawnattr_getsigignore_np(const spawnattr_t * __restrict,
+    sigset_t * __restrict);
 int spawnattr_getrlimit_np(const spawnattr_t * __restrict,
 						   int,
 						   bool * __restrict,
@@ -97,9 +100,10 @@ int spawnattr_setschedparam(spawnattr_t * __restrict,
 int spawnattr_setschedpolicy(spawnattr_t *, int);
 int spawnattr_setsigdefault(spawnattr_t * __restrict,
     const sigset_t * __restrict);
-int spawnattr_setsigignore_np(spawnattr_t * __restrict,
-    const sigset_t * __restrict);
 int spawnattr_setsigmask(spawnattr_t * __restrict,
+    const sigset_t * __restrict);
+/* non-POSIX extensions */
+int spawnattr_setsigignore_np(spawnattr_t * __restrict,
     const sigset_t * __restrict);
 int spawnattr_setrlimit_np(spawnattr_t * __restrict,
 						   int,

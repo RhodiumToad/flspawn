@@ -408,7 +408,7 @@ process_spawnattr(struct spawn_args *psa)
 	const spawnattr_t sa = *(psa->sa);
 
     /* Set session */
-    if (sa->sa_flags & SPAWN_SETSID_NP)
+    if (sa->sa_flags & SPAWN_SETSID)
 		if (setsid() != 0)
 			return report_err(psa, errno, "setsid", NULL);
 
@@ -767,6 +767,7 @@ execvPe(const char *name,
 	(MINSIGSTKSZ + 512 + MAX(PATH_MAX, KINFO_PROC_SIZE))
 #endif
 
+__noinline
 static int
 _spawn_thr(void *data)
 {
@@ -800,7 +801,7 @@ _spawn_thr(void *data)
 	if (psa->verbose)
 		report_err(psa, err, "spawn failed", NULL);
 
-    /* This is called in such a way that it must not exit. */
+    /* This is called in such a way that it must not return. */
     _exit(127);
 }
 
@@ -1303,6 +1304,7 @@ spawnattr_init(spawnattr_t *ret)
 
 	/* Set defaults as specified by POSIX, cleared above */
 	*sa = nullsa;
+	sigfillset(&sa->sa_sigdefault);
 	*ret = sa;
 	return 0;
 }

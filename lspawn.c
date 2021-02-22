@@ -43,6 +43,10 @@ extern const char **environ;
 #error This code requires Lua 5.3 or later
 #endif
 
+#if LUA_VERSION_NUM < 504
+#define luaL_pushfail(L_) lua_pushnil(L_)
+#endif
+
 //==========================================================================
 
 //
@@ -208,7 +212,7 @@ lspawn_fa_tostring(lua_State *L)
 												  &lspawn_file_action_meta);
 	const char *name = NULL;
 	const char *fname = NULL;
-	char extras[64];
+	char		extras[64];
 
 	extras[0] = 0;
 
@@ -325,8 +329,9 @@ lspawn_fileflags(lua_State *L, int idx)
 static int
 lspawn_fa_make_open(lua_State *L)
 {
-	int flags = lspawn_fileflags(L, 2);
-	int perms = luaL_optinteger(L, 3, 0666);
+	int			flags = lspawn_fileflags(L, 2);
+	int			perms = luaL_optinteger(L, 3, 0666);
+
 	luaL_checkstring(L, 1);
 
 	lspawn_fa_new(L, FA_OPEN, flags, perms);
@@ -338,8 +343,8 @@ lspawn_fa_make_open(lua_State *L)
 static int
 lspawn_fa_make_inherit_from(lua_State *L)
 {
-	int isint = 0;
-	int fd = lua_tointegerx(L, 1, &isint);
+	int			isint = 0;
+	int			fd = lua_tointegerx(L, 1, &isint);
 	luaL_Stream *fp = luaL_testudata(L, 1, LUA_FILEHANDLE);
 
 	luaL_argcheck(L, ((isint && fd >= 0) || (fp && fp->f && !fp->closef)),
@@ -355,7 +360,8 @@ lspawn_fa_make_inherit_from(lua_State *L)
 static int
 lspawn_fa_make_copy_from(lua_State *L)
 {
-	int fd = luaL_checkinteger(L, 1);
+	int			fd = luaL_checkinteger(L, 1);
+
 	return lspawn_fa_new(L, FA_INHERIT, fd, 0);
 }
 
@@ -412,6 +418,7 @@ static int
 lspawn_file_actions_gc(lua_State *L)
 {
 	spawn_file_actions_t *p = check_object(L, 1, &lspawn_file_actions_meta);
+
 	lua_pushnil(L);
 	lua_setmetatable(L, 1);
 	spawn_file_actions_destroy(p);
@@ -422,6 +429,7 @@ static spawn_file_actions_t *
 lspawn_file_actions_new(lua_State *L)
 {
 	spawn_file_actions_t *p = make_object(L, &lspawn_file_actions_meta);
+
 	spawn_file_actions_init(p);
 	return p;
 }
@@ -452,7 +460,7 @@ process_files_default(lua_State *L,
 			return file_act_err(L, err);
 	}
 
-	int err = spawn_file_actions_addclosefrom_np(facts, 3);
+	int	err = spawn_file_actions_addclosefrom_np(facts, 3);
 	if (unlikely(err != 0))
 		return file_act_err(L, err);
 
@@ -476,6 +484,7 @@ static int
 spawn_pipe_close(lua_State *L)
 {
 	SPStream *s = luaL_checkudata(L, 1, LUA_FILEHANDLE);
+
 	if (s->lstr.f)
 	{
 		fclose(s->lstr.f);
@@ -498,6 +507,7 @@ static int
 spawn_file_close(lua_State *L)
 {
 	luaL_Stream *s = luaL_checkudata(L, 1, LUA_FILEHANDLE);
+
 	if (s->f)
 	{
 		int res = fclose(s->f);
@@ -517,9 +527,9 @@ make_pipe(lua_State *L,
 		  enum lspawn_fa_type fa_type,
 		  int idx)
 {
-	int fds[2];
-	int parent_end;
-	int child_end;
+	int			fds[2];
+	int			parent_end;
+	int			child_end;
 	const char *parent_mode;
 
 	SPStream *sp = lua_newuserdata(L, sizeof(SPStream));
@@ -591,21 +601,22 @@ make_pipe(lua_State *L,
 static int
 process_files(lua_State *L,
 			  int ftab_idx, int pipe_idx,
-			  spawn_file_actions_t *facts, int foreground_fd)
+			  spawn_file_actions_t *facts,
+			  int foreground_fd)
 {
-	int err;
-	int hiwat_out = 2;
-	int hiwat_in = 0;
-	int free_fd;
-	int nullfd = -1;
-	int pipe_child_fd = -1;
-	int pipe_parent_fd = -1;
-	int dst;
-	int tmpt_idx = 0;
-	int *map_in_counts;
-	int *map_out_to_in;
-	int map_in_buf[128];
-	int map_out_buf[128];
+	int			err;
+	int			hiwat_out = 2;
+	int			hiwat_in = 0;
+	int			free_fd;
+	int			nullfd = -1;
+	int			pipe_child_fd = -1;
+	int			pipe_parent_fd = -1;
+	int			dst;
+	int			tmpt_idx = 0;
+	int		   *map_in_counts;
+	int		   *map_out_to_in;
+	int			map_in_buf[128];
+	int			map_out_buf[128];
 
 	// ftab isn't a sequence: it may be sparse. So we first iterate it in
 	// arbitrary order to find the maximum integer key present, and reject any
@@ -667,7 +678,7 @@ process_files(lua_State *L,
 	for (int i = 0; i <= hiwat_out; ++i)
 	{
 		enum lspawn_fa_type fa_type = FA_INVALID;
-		int fd_in = -1;
+		int		fd_in = -1;
 
 		map_out_to_in[i] = -1;
 
@@ -984,7 +995,8 @@ process_files(lua_State *L,
 static int
 process_args(lua_State *L, int cmd_idx, int argt_idx)
 {
-	bool have_argv0 = false;
+	bool		have_argv0 = false;
+	int			nargs = 1;
 
 	// argv[0] is defaulted to the command string if not in the table
 
@@ -1002,8 +1014,6 @@ process_args(lua_State *L, int cmd_idx, int argt_idx)
 
 	if (!have_argv0)
 		lua_pushvalue(L, cmd_idx);
-
-	int nargs = 1;
 
 	if (!lua_isnil(L, argt_idx))
 	{
@@ -1038,8 +1048,8 @@ process_args(lua_State *L, int cmd_idx, int argt_idx)
 static int
 process_envs(lua_State *L, int envt_idx, int iter_idx, bool inherit)
 {
-	int nenvs = 0;
-	bool have_env = !lua_isnil(L, envt_idx);
+	int			nenvs = 0;
+	bool		have_env = !lua_isnil(L, envt_idx);
 
 	if (inherit && !have_env)
 		return -1;
@@ -1135,7 +1145,7 @@ vectorize_args(lua_State *L,
 			   int nargs,
 			   int nenvs)
 {
-	int i = 0;
+	int			i = 0;
 
 	for (; nargs > 0; --nargs, ++idx)
 		argv[i++] = lua_tostring(L, idx);
@@ -1145,10 +1155,10 @@ vectorize_args(lua_State *L,
 		return;
 
 	for (; nenvs > 0; --nenvs, ++idx)
-		if (lua_islightuserdata(L, idx))
-			argv[i++] = lua_touserdata(L, idx);
-		else
-			argv[i++] = lua_tostring(L, idx);
+	{
+		const char *ptr = lua_tostring(L, idx);
+		argv[i++] = ptr ? ptr : lua_touserdata(L, idx);
+	}
 	argv[i++] = NULL;
 }
 
@@ -1203,20 +1213,30 @@ iterate_sigs(sigset_t *sigs, int sig)
 		}
 }
 
-// Given a sequence on the top of the lua stack, add the signals in it
-// to sigs_add and remove them from sigs_del. Signals can be specified
-// by name or number.
+// Given a sequence at sigt_idx[name], add the signals in it to sigs_add and
+// remove them from sigs_del. Signals can be specified by name or number.
 
-static int
-process_siglist(lua_State *L, sigset_t *sigs_add, sigset_t *sigs_del)
+static bool
+process_siglist(lua_State *L,
+				int sigt_idx, const char *name,
+				sigset_t *sigs_add, sigset_t *sigs_del)
 {
-	int argt;
+	int			argt;
+
+	if (lua_getfield(L, sigt_idx, name) == LUA_TNIL)
+	{
+		lua_pop(L, 1);
+		return false;
+	}
+
+	if (!is_indexable(L, -1))
+		return luaL_error(L, "bad signal %s table, expected indexable value", name);
 
 	for (int i = 1; (argt = lua_geti(L, -1, i)) != LUA_TNIL; ++i)
 	{
-		int isint = 0;
-		int rc = 0;
-		int sig;
+		int		isint = 0;
+		int		rc = 0;
+		int		sig;
 
 		if (argt != LUA_TNUMBER)
 			argt = lua_rawget(L, lua_upvalueindex(3));
@@ -1234,8 +1254,8 @@ process_siglist(lua_State *L, sigset_t *sigs_add, sigset_t *sigs_del)
 			return luaL_argerror(L, 1, "bad entry in signals table");
 		lua_pop(L, 1);
 	}
-	lua_pop(L, 1);
-	return 0;
+	lua_pop(L, 2);
+	return true;
 }
 
 // process the signals argument.
@@ -1249,50 +1269,31 @@ process_signals(lua_State *L,
 				sigset_t *wait_ignore_sigs,
 				sigset_t *wait_block_sigs)
 {
+	sigset_t	tmp_wait_ignore;
+	sigset_t	tmp_wait_block;
+
 	sigt_idx = lua_absindex(L, sigt_idx);
+
+	sigemptyset(&tmp_wait_ignore);
+	sigemptyset(&tmp_wait_block);
 
 	// initially default_sigs is full and the others empty.
 	// ignored sigs are added to ignore_sigs and removed from
 	// default_sigs; preserved sigs are removed from default_sigs;
 	// blocked sigs added to block_sigs.
 
-	lua_getfield(L, sigt_idx, "ignore");
-	if (is_indexable(L, -1))
-		process_siglist(L, ignore_sigs, default_sigs);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal ignore table, expected indexable value");
+	process_siglist(L, sigt_idx, "ignore", ignore_sigs, default_sigs);
+	process_siglist(L, sigt_idx, "block", block_sigs, NULL);
+	process_siglist(L, sigt_idx, "preserve", NULL, default_sigs);
 
-	lua_getfield(L, sigt_idx, "block");
-	if (is_indexable(L, -1))
-		process_siglist(L, block_sigs, NULL);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal block table, expected indexable value");
+	if (wait_block_sigs
+		&& process_siglist(L, sigt_idx, "block_waiting", &tmp_wait_block, NULL))
+		*wait_block_sigs = tmp_wait_block;
 
-	lua_getfield(L, sigt_idx, "block_waiting");
-	if (is_indexable(L, -1))
-	{
-		sigemptyset(wait_block_sigs);
-		process_siglist(L, wait_block_sigs, NULL);
-	}
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal block_waiting table, expected indexable value");
+	if (wait_ignore_sigs
+		&& process_siglist(L, sigt_idx, "ignore_waiting", &tmp_wait_ignore, NULL))
+		*wait_ignore_sigs = tmp_wait_ignore;
 
-	lua_getfield(L, sigt_idx, "ignore_waiting");
-	if (is_indexable(L, -1))
-	{
-		sigemptyset(wait_ignore_sigs);
-		process_siglist(L, wait_ignore_sigs, NULL);
-	}
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal ignore_waiting table, expected indexable value");
-
-	lua_getfield(L, sigt_idx, "preserve");
-	if (is_indexable(L, -1))
-		process_siglist(L, NULL, default_sigs);
-	else if (!lua_isnil(L, -1))
-		return luaL_argerror(L, 1, "bad signal preserve table, expected indexable value");
-
-	lua_pop(L, 3);
 	return 0;
 }
 
@@ -1303,8 +1304,8 @@ process_signals(lua_State *L,
 static uint64_t
 u64_mul(lua_State *L, uint64_t a, uint64_t b)
 {
-	uint64_t result;
-	bool overflow;
+	uint64_t	result;
+	bool		overflow;
 
 #if __has_builtin(__builtin_mul_overflow)
 	overflow = __builtin_mul_overflow(a, b, &result);
@@ -1322,7 +1323,7 @@ typedef bool (rv_mult)(char *ptr, uint64_t *mult);
 static bool
 rvm_size(char *ptr, uint64_t *multp)
 {
-	uint64_t mult = 1;
+	uint64_t	mult = 1;
 
 	switch (*ptr)
 	{
@@ -1354,7 +1355,7 @@ rvm_size(char *ptr, uint64_t *multp)
 static bool
 rvm_time(char *ptr, uint64_t *multp)
 {
-	uint64_t mult = 1;
+	uint64_t	mult = 1;
 
 	switch (*ptr)
 	{
@@ -1390,13 +1391,13 @@ rv_from_string(lua_State *L,
 			   const char *ptr,
 			   rv_mult *func)
 {
-	char *endptr = NULL;
-	bool valid = false;
+	char	   *endptr = NULL;
+	bool		valid = false;
+	uint64_t	mult = 1;
 
 	errno = 0;
 
-	uint64_t sz = strtoull(ptr, &endptr, 0);
-	uint64_t mult = 1;
+	uint64_t	sz = strtoull(ptr, &endptr, 0);
 
 	if (endptr != ptr && errno == 0)
 	{
@@ -1526,7 +1527,7 @@ rv_getvalue(lua_State *L, int res, int vtype)
 static bool
 process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
 {
-	bool result = false;
+	bool		result = false;
 
 	idx = lua_absindex(L, idx);
 
@@ -1535,7 +1536,8 @@ process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
 		if (rlimit_table[res].names[0] == NULL)
 			continue;
 
-		int vtype = lua_geti(L, idx, res);
+		int		vtype = lua_geti(L, idx, res);
+
 		for (int i = 0;
 			 vtype == LUA_TNIL
 				 && i < countof(rlimit_table[res].names)
@@ -1555,14 +1557,14 @@ process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
 		}
 		else if (is_indexable(L, -1))
 		{
-			int vtype1 = lua_getfield(L, -1, "cur");
+			int	vtype1 = lua_getfield(L, -1, "cur");
 			if (vtype1 == LUA_TNIL)
 			{
 				lua_pop(L, 1);
 				vtype1 = lua_getfield(L, -1, "rlim_cur");
 			}
 
-			int vtype2 = lua_getfield(L, -2, "max");
+			int	vtype2 = lua_getfield(L, -2, "max");
 			if (vtype2 == LUA_TNIL)
 			{
 				lua_pop(L, 1);
@@ -1823,12 +1825,60 @@ lspawn_call_do_args(lua_State *L, int idx)
 static int
 my_execresult(lua_State *L, int status)
 {
-	bool exited = WIFEXITED(status);
-	bool signaled = WIFSIGNALED(status);
+	bool		exited = WIFEXITED(status);
+	bool		signaled = WIFSIGNALED(status);
 	lua_pushboolean(L, exited && (WEXITSTATUS(status) == 0));
 	lua_pushstring(L, signaled ? "signal" : "exit");
 	lua_pushinteger(L, status);
 	return 3;
+}
+
+static int
+my_errresult(lua_State *L, int err)
+{
+	luaL_pushfail(L);
+	lua_pushstring(L, strerror(err));
+	lua_pushinteger(L, err);
+	return 3;
+}
+
+static int
+wait_for_proc(lua_State *L,
+			  pid_t child_pid,
+			  sigset_t *wait_ignore_sigs,
+			  sigset_t *save_sigmask)
+{
+	struct sigaction wait_oact[sizeof(sigset_t)*8];
+	int			wait_oact_err[sizeof(sigset_t)*8];
+
+	struct sigaction nact = { .sa_flags = 0, .sa_handler = SIG_IGN };
+	int			i;
+	int			status = 0;
+	int			err;
+	pid_t		rpid;
+
+	i = 0;
+	while ((i = iterate_sigs(wait_ignore_sigs, i)) >= 0)
+		wait_oact_err[i] = sigaction(i, &nact, &wait_oact[i]);
+
+	do
+		rpid = waitpid(child_pid, &status, 0);
+	while (rpid < 0 && errno == EINTR);
+	err = errno;
+
+	i = 0;
+	while ((i = iterate_sigs(wait_ignore_sigs, i)) >= 0)
+		if (wait_oact_err[i] == 0)
+			sigaction(i, &wait_oact[i], NULL);
+
+	safe_setsigmask(SIG_SETMASK, save_sigmask, NULL);
+	if (rpid == child_pid)
+		return my_execresult(L, status);
+	else if (rpid >= 0)
+		return luaL_error(L, "waitpid returned wrong pid: expected %ld got %ld",
+						  (long)child_pid, (long)rpid);
+	else
+		return my_errresult(L, err);
 }
 
 // Actual main entry point.
@@ -1848,8 +1898,6 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	sigset_t	wait_block_sigs;
 	sigset_t	wait_ignore_sigs;
 	sigset_t	save_sigmask;
-	struct sigaction wait_oact[sizeof(sigset_t)*8];
-	int			wait_oact_err[sizeof(sigset_t)*8];
 
 	spawnattr_t	sa;
 	spawn_file_actions_t *file_acts;
@@ -1940,7 +1988,7 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	if (lua_toboolean(L, SIDX_RESET_IDS))
 		spawn_attr_flags |= SPAWN_RESETIDS;
 	if (lua_toboolean(L, SIDX_SETSID))
-		spawn_attr_flags |= SPAWN_SETSID_NP;
+		spawn_attr_flags |= SPAWN_SETSID;
 	if (lua_toboolean(L, SIDX_PGROUP))
 	{
 		pgrp = (pid_t) lua_tointeger(L, SIDX_PGROUP);
@@ -1982,8 +2030,10 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 			spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP | SPAWN_SETSIGMASK);
 	}
 	else if (!lua_isnil(L, SIDX_SIGNALS))
-		process_signals(L, SIDX_SIGNALS, &default_sigs, &ignore_sigs, &block_sigs,
-						&wait_ignore_sigs, &wait_block_sigs);
+		process_signals(L, SIDX_SIGNALS,
+						&default_sigs, &ignore_sigs, &block_sigs,
+						do_wait ? &wait_ignore_sigs : NULL,
+						do_wait ? &wait_block_sigs : NULL);
 
 	for (int res = 0; res < RLIM_NLIMITS; ++res)
 		rlim_set[res] = false;
@@ -2142,49 +2192,11 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	if (err)
 	{
 		auto_closevar_compat(L, SIDX_PIPEOBJS);
-
-		lua_pushnil(L);
-		lua_pushstring(L, strerror(err));
-		lua_pushinteger(L, err);
-		return 3;
+		return my_errresult(L, err);
 	}
 
 	if (do_wait)
-	{
-		struct sigaction nact = { .sa_flags = 0, .sa_handler = SIG_IGN };
-		int i;
-		int status = 0;
-		int err;
-		pid_t rpid;
-
-		i = 0;
-		while ((i = iterate_sigs(&wait_ignore_sigs, i)) >= 0)
-			wait_oact_err[i] = sigaction(i, &nact, &wait_oact[i]);
-
-		do
-			rpid = waitpid(child_pid, &status, 0);
-		while (rpid < 0 && errno == EINTR);
-		err = errno;
-
-		i = 0;
-		while ((i = iterate_sigs(&wait_ignore_sigs, i)) >= 0)
-			if (wait_oact_err[i] == 0)
-				sigaction(i, &wait_oact[i], NULL);
-
-		safe_setsigmask(SIG_SETMASK, &save_sigmask, NULL);
-		if (rpid == child_pid)
-			return my_execresult(L, status);
-		else if (rpid >= 0)
-			return luaL_error(L, "waitpid returned wrong pid: expected %ld got %ld",
-							  (long)child_pid, (long)rpid);
-		else
-		{
-			lua_pushnil(L);
-			lua_pushstring(L, strerror(err));
-			lua_pushinteger(L, err);
-			return 3;
-		}
-	}
+		return wait_for_proc(L, child_pid, &wait_ignore_sigs, &save_sigmask);
 
 	lua_pushinteger(L, child_pid);
 
