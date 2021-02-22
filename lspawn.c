@@ -1,7 +1,7 @@
 /*
  * lspawn.c
  *
- * Copyright 2020 Andrew Gierth.
+ * Copyright 2020-2021 Andrew Gierth.
  * SPDX-License-Identifier: BSD-2-Clause OR MIT
  *
  * Though this file is initially distributed under the 2-clause BSD license OR
@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 #include <sys/types.h>
 #include <sys/resource.h>
@@ -372,7 +373,7 @@ lspawn_fa_call(lua_State *L)
 
 // These are created as functions
 
-static luaL_Reg lspawn_funcs[] = {
+static luaL_Reg lspawn_fa_funcs[] = {
 	{ "inherit_from", lspawn_fa_make_inherit_from },
 	{ "copy_from", lspawn_fa_make_copy_from },
 	{ "open", lspawn_fa_make_open },
@@ -381,13 +382,13 @@ static luaL_Reg lspawn_funcs[] = {
 
 // And these functions are called to create their objects
 
-static luaL_Reg lspawn_objs[] = {
-	{"null", lspawn_fa_make_null },
-	{"close", lspawn_fa_make_close },
-	{"inherit", lspawn_fa_make_inherit },
-	{"input_pipe", lspawn_fa_make_inpipe },
-	{"output_pipe", lspawn_fa_make_outpipe },
-	{NULL, NULL }
+static luaL_Reg lspawn_fa_objs[] = {
+	{ "null", lspawn_fa_make_null },
+	{ "close", lspawn_fa_make_close },
+	{ "inherit", lspawn_fa_make_inherit },
+	{ "input_pipe", lspawn_fa_make_inpipe },
+	{ "output_pipe", lspawn_fa_make_outpipe },
+	{ NULL, NULL }
 };
 
 //
@@ -692,6 +693,8 @@ process_files(lua_State *L,
 						case FA_OUTPIPE:
 							if (pipe_child_fd >= 0)
 								return luaL_argerror(L, 1, "bad entry in files table, only one pipe object permitted");
+							if (pipe_idx == 0)
+								return luaL_argerror(L, 1, "bad entry in files table, pipes not permitted with wait or exec");
 							pipe_parent_fd = make_pipe(L, fa_type, pipe_idx);
 							pipe_child_fd = i;
 							fd_in = pipe_parent_fd;
@@ -1171,6 +1174,35 @@ make_signal_table(lua_State *L)
 	}
 }
 
+// It beggars belief that this ghodawful hack is needed.
+
+extern int __isthreaded;
+
+static int
+safe_setsigmask(int how,
+				sigset_t * __restrict newmask,
+				sigset_t * __restrict oldmask)
+{
+	if (__isthreaded)
+		return pthread_sigmask(how, newmask, oldmask);
+	else
+		return sigprocmask(how, newmask, oldmask);
+}
+
+// Iterate over a sigset.
+
+static int
+iterate_sigs(sigset_t *sigs, int sig)
+{
+	for (;;)
+		switch (sigismember(sigs, ++sig))
+		{
+			case -1:	return -1;
+			case  0:	continue;
+			default:	return sig;
+		}
+}
+
 // Given a sequence on the top of the lua stack, add the signals in it
 // to sigs_add and remove them from sigs_del. Signals can be specified
 // by name or number.
@@ -1213,7 +1245,9 @@ process_signals(lua_State *L,
 				int sigt_idx,
 				sigset_t *default_sigs,
 				sigset_t *ignore_sigs,
-				sigset_t *block_sigs)
+				sigset_t *block_sigs,
+				sigset_t *wait_ignore_sigs,
+				sigset_t *wait_block_sigs)
 {
 	sigt_idx = lua_absindex(L, sigt_idx);
 
@@ -1233,6 +1267,24 @@ process_signals(lua_State *L,
 		process_siglist(L, block_sigs, NULL);
 	else if (!lua_isnil(L, -1))
 		return luaL_argerror(L, 1, "bad signal block table, expected indexable value");
+
+	lua_getfield(L, sigt_idx, "block_waiting");
+	if (is_indexable(L, -1))
+	{
+		sigemptyset(wait_block_sigs);
+		process_siglist(L, wait_block_sigs, NULL);
+	}
+	else if (!lua_isnil(L, -1))
+		return luaL_argerror(L, 1, "bad signal block_waiting table, expected indexable value");
+
+	lua_getfield(L, sigt_idx, "ignore_waiting");
+	if (is_indexable(L, -1))
+	{
+		sigemptyset(wait_ignore_sigs);
+		process_siglist(L, wait_ignore_sigs, NULL);
+	}
+	else if (!lua_isnil(L, -1))
+		return luaL_argerror(L, 1, "bad signal ignore_waiting table, expected indexable value");
 
 	lua_getfield(L, sigt_idx, "preserve");
 	if (is_indexable(L, -1))
@@ -1560,19 +1612,10 @@ process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
 
 // Actual main library code.
 
-static int lspawn_call(lua_State *L);
-
-static RegMeta lspawn_lib_meta = {
-	.name = "lspawn library",
-	.metamethods = (luaL_Reg[]){
-		{ "__call", lspawn_call },
-		{ NULL, NULL }
-	}
-};
-
 //
 // spawn {
 //   exec = boolean,        -- if true, exec() the process (no return)
+//   wait = boolean,		-- if true, waitpid() for the child
 //   verbose = string,      -- prefix for verbose errors
 //   program = string,		-- required; filename of executable
 //   args = table,			-- optional: argument strings
@@ -1626,16 +1669,17 @@ static RegMeta lspawn_lib_meta = {
 
 #define SIDX_SIGNALS	(SIDX__DROP1 + 1)
 #define SIDX_EXEC		(SIDX__DROP1 + 2)
-#define SIDX_RESET_IDS	(SIDX__DROP1 + 3)
-#define SIDX_SETSID		(SIDX__DROP1 + 4)
-#define SIDX_PGROUP		(SIDX__DROP1 + 5)
-#define SIDX_FOREGROUND	(SIDX__DROP1 + 6)
-#define SIDX_CLEANENV	(SIDX__DROP1 + 7)
-#define SIDX_JAIL_BEFORE (SIDX__DROP1 + 8)
-#define SIDX_JAIL_AFTER (SIDX__DROP1 + 9)
-#define SIDX_RESOURCES	(SIDX__DROP1 + 10)
+#define SIDX_WAIT		(SIDX__DROP1 + 3)
+#define SIDX_RESET_IDS	(SIDX__DROP1 + 4)
+#define SIDX_SETSID		(SIDX__DROP1 + 5)
+#define SIDX_PGROUP		(SIDX__DROP1 + 6)
+#define SIDX_FOREGROUND	(SIDX__DROP1 + 7)
+#define SIDX_CLEANENV	(SIDX__DROP1 + 8)
+#define SIDX_JAIL_BEFORE (SIDX__DROP1 + 9)
+#define SIDX_JAIL_AFTER (SIDX__DROP1 + 10)
+#define SIDX_RESOURCES	(SIDX__DROP1 + 11)
 
-#define SIDX__LASTARG	(SIDX__DROP1 + 10)
+#define SIDX__LASTARG	(SIDX__DROP1 + 11)
 
 typedef const char *(validate_func)(lua_State *L, int typ);
 
@@ -1699,6 +1743,7 @@ static const struct {
 	[SIDX_SIGNALS]		=	{ "signals",		v_s_signals,	false },
 	[SIDX_RESOURCES]	=	{ "resources",		v_indexable,	false },
 	[SIDX_EXEC]			=	{ "exec",			v_boolean,		false },
+	[SIDX_WAIT]			=	{ "wait",			v_boolean,		false },
 	[SIDX_RESET_IDS]	=	{ "reset_ids",		v_boolean,		false },
 	[SIDX_SETSID]		=	{ "new_session", 	v_boolean,		false },
 	[SIDX_PGROUP]		=	{ "process_group", 	v_int_or_bool,	false },
@@ -1772,14 +1817,40 @@ lspawn_call_do_args(lua_State *L, int idx)
 	lua_pop(L, 1);
 }
 
-// Actual main entry point.
+// This ought to be luaL_execresult, but in 5.4 that is broken due to a very
+// misguided attempt at windows compatibility.
 
 static int
-lspawn_call(lua_State *L)
+my_execresult(lua_State *L, int status)
+{
+	bool exited = WIFEXITED(status);
+	bool signaled = WIFSIGNALED(status);
+	lua_pushboolean(L, exited && (WEXITSTATUS(status) == 0));
+	lua_pushstring(L, signaled ? "signal" : "exit");
+	lua_pushinteger(L, status);
+	return 3;
+}
+
+// Actual main entry point.
+
+enum spawn_op {
+	LSPAWN_CALL,
+	LSPAWN_WAIT
+};
+
+static int
+lspawn_doit(lua_State *L, enum spawn_op context)
 {
 	sigset_t	default_sigs;
 	sigset_t	ignore_sigs;
 	sigset_t	block_sigs;
+
+	sigset_t	wait_block_sigs;
+	sigset_t	wait_ignore_sigs;
+	sigset_t	save_sigmask;
+	struct sigaction wait_oact[sizeof(sigset_t)*8];
+	int			wait_oact_err[sizeof(sigset_t)*8];
+
 	spawnattr_t	sa;
 	spawn_file_actions_t *file_acts;
 	short		spawn_attr_flags = (SPAWN_SETSIGDEF
@@ -1793,6 +1864,7 @@ lspawn_call(lua_State *L)
 	struct rlimit rlim[RLIM_NLIMITS];
 
 	bool		do_exec = false;
+	bool		do_wait = (context == LSPAWN_WAIT);
 	bool		inherit_env = true;
 	int			foreground_fd = -1;
 	const char *filename;
@@ -1815,11 +1887,6 @@ lspawn_call(lua_State *L)
 	// reallocs.
 
 	luaL_checkstack(L, 100 + SIDX__LASTARG, "in spawn");
-
-	// Argument errors currently show as off-by-one in __call metamethods
-	// (which this is). Jiggle the stack to compensate.
-	if (verify_object_exact(L, 1, &lspawn_lib_meta))
-		lua_remove(L, 1);
 
 	// Allow simplified call style of spawn(prog,arg,...) by converting it to
 	// the full table form; prog must be a string. We assume that simpified
@@ -1860,6 +1927,10 @@ lspawn_call(lua_State *L)
 	lspawn_call_do_args(L, 1);
 
 	do_exec = lua_toboolean(L, SIDX_EXEC);
+	if (!lua_isnil(L, SIDX_WAIT))
+		do_wait = lua_toboolean(L, SIDX_WAIT);
+	if (do_wait && do_exec)
+		return luaL_argerror(L, 1, "cannot specify both wait and exec");
 	if (lua_toboolean(L, SIDX_VERBOSE)
 		|| (do_exec && lua_type(L, SIDX_VERBOSE) != LUA_TBOOLEAN))
 	{
@@ -1890,12 +1961,29 @@ lspawn_call(lua_State *L)
 	sigfillset(&default_sigs);
 	sigemptyset(&ignore_sigs);
 	sigemptyset(&block_sigs);
+	if (do_wait)
+	{
+		sigemptyset(&wait_ignore_sigs);
+		sigemptyset(&wait_block_sigs);
+		sigaddset(&wait_block_sigs, SIGINT);
+		sigaddset(&wait_block_sigs, SIGQUIT);
+		sigaddset(&wait_block_sigs, SIGCHLD);
+	}
 
 	// If a string, it must be "preserve", already checked above
 	if (lua_type(L, SIDX_SIGNALS) == LUA_TSTRING)
-		spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP | SPAWN_SETSIGMASK);
+	{
+		if (do_wait)
+		{
+			spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP);
+			safe_setsigmask(SIG_UNBLOCK, NULL, &block_sigs);
+		}
+		else
+			spawn_attr_flags &= ~(SPAWN_SETSIGDEF | SPAWN_SETSIGIGN_NP | SPAWN_SETSIGMASK);
+	}
 	else if (!lua_isnil(L, SIDX_SIGNALS))
-		process_signals(L, SIDX_SIGNALS, &default_sigs, &ignore_sigs, &block_sigs);
+		process_signals(L, SIDX_SIGNALS, &default_sigs, &ignore_sigs, &block_sigs,
+						&wait_ignore_sigs, &wait_block_sigs);
 
 	for (int res = 0; res < RLIM_NLIMITS; ++res)
 		rlim_set[res] = false;
@@ -1973,7 +2061,9 @@ lspawn_call(lua_State *L)
 	if (lua_isnil(L, SIDX_FILES))
 		process_files_default(L, file_acts, foreground_fd);
 	else
-		process_files(L, SIDX_FILES, SIDX_PIPEOBJS, file_acts, foreground_fd);
+		process_files(L, SIDX_FILES,
+					  (do_exec || do_wait) ? 0 : SIDX_PIPEOBJS,
+					  file_acts, foreground_fd);
 
 	if (jail_after >= 0)
 	{
@@ -1997,6 +2087,11 @@ lspawn_call(lua_State *L)
 		if (unlikely(err != 0))
 			return file_act_err(L, err);
 	}
+
+	// set up to block signals if we'll be waiting.
+
+	if (do_wait)
+		safe_setsigmask(SIG_BLOCK, &wait_block_sigs, &save_sigmask);
 
 	// No Lua errors after here, so we don't need to worry about
 	// freeing the spawnattr on a nonlocal exit.
@@ -2054,6 +2149,43 @@ lspawn_call(lua_State *L)
 		return 3;
 	}
 
+	if (do_wait)
+	{
+		struct sigaction nact = { .sa_flags = 0, .sa_handler = SIG_IGN };
+		int i;
+		int status = 0;
+		int err;
+		pid_t rpid;
+
+		i = 0;
+		while ((i = iterate_sigs(&wait_ignore_sigs, i)) >= 0)
+			wait_oact_err[i] = sigaction(i, &nact, &wait_oact[i]);
+
+		do
+			rpid = waitpid(child_pid, &status, 0);
+		while (rpid < 0 && errno == EINTR);
+		err = errno;
+
+		i = 0;
+		while ((i = iterate_sigs(&wait_ignore_sigs, i)) >= 0)
+			if (wait_oact_err[i] == 0)
+				sigaction(i, &wait_oact[i], NULL);
+
+		safe_setsigmask(SIG_SETMASK, &save_sigmask, NULL);
+		if (rpid == child_pid)
+			return my_execresult(L, status);
+		else if (rpid >= 0)
+			return luaL_error(L, "waitpid returned wrong pid: expected %ld got %ld",
+							  (long)child_pid, (long)rpid);
+		else
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, strerror(err));
+			lua_pushinteger(L, err);
+			return 3;
+		}
+	}
+
 	lua_pushinteger(L, child_pid);
 
 	if (lua_type(L, SIDX_PIPEOBJS) != LUA_TNIL)
@@ -2066,6 +2198,39 @@ lspawn_call(lua_State *L)
 
 	return 1;
 }
+
+
+static int lspawn_call(lua_State *L);
+
+static RegMeta lspawn_lib_meta = {
+	.name = "lspawn library",
+	.metamethods = (luaL_Reg[]){
+		{ "__call", lspawn_call },
+		{ NULL, NULL }
+	}
+};
+
+static int
+lspawn_call(lua_State *L)
+{
+	// Argument errors currently show as off-by-one in __call metamethods
+	// (which this is). Jiggle the stack to compensate.
+	if (verify_object_exact(L, 1, &lspawn_lib_meta))
+		lua_remove(L, 1);
+
+	return lspawn_doit(L, LSPAWN_CALL);
+}
+
+static int
+lspawn_wait(lua_State *L)
+{
+	return lspawn_doit(L, LSPAWN_WAIT);
+}
+
+static luaL_Reg lspawn_funcs[] = {
+	{ "wait", lspawn_wait },
+	{ NULL, NULL }
+};
 
 //==========================================================================
 
@@ -2087,11 +2252,16 @@ luaopen_lspawn(lua_State *L)
 	lspawn_call_init_args(L);
 	lua_pushstring(L, "=");
 	make_signal_table(L);
+
+	lua_pushvalue(L, -3);
+	lua_pushvalue(L, -3);
+	lua_pushvalue(L, -3);
 	make_metatable(L, &lspawn_lib_meta, 3);
 	lua_setmetatable(L, 1);
 
-	luaL_setfuncs(L, lspawn_funcs, 0);
-	for (luaL_Reg *rp = lspawn_objs; rp->name != NULL; ++rp)
+	luaL_setfuncs(L, lspawn_funcs, 3);
+	luaL_setfuncs(L, lspawn_fa_funcs, 0);
+	for (luaL_Reg *rp = lspawn_fa_objs; rp->name != NULL; ++rp)
 	{
 		rp->func(L);
 		lua_setfield(L, -2, rp->name);
