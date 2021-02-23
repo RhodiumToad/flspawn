@@ -21,6 +21,14 @@ or
 
 	flag,status_or_err,code = spawn.wait("prog","arg","arg")
 
+or
+
+	pipe,err,errno = spawn.read_from("prog","arg","arg")
+
+or
+
+	pipe,err,errno = spawn.write_to("prog","arg","arg")
+
 This creates a subprocess which will execute `prog` (searched for in
 the caller's `PATH`) with the specified args. No shell is executed
 unless `prog` itself is a shell or a shell script. No interpretation
@@ -40,6 +48,12 @@ success code), a string `"exit"` or `"signal"`, and an exit code.
 While waiting for the subprocess, the signals `SIGINT`, `SIGQUIT` and
 `SIGCHLD` are blocked (but unlike `system()`, no signals are ignored -
 see below for how to do that).
+
+For `spawn.read_from()` and `spawn.write_to()`, the result is
+equivalent to that of `io.popen()`. For `spawn.read_from()`, the
+invoked subprocess will have `/dev/null` as its stdin; for
+`spawn.write_to()`, the subprocess stdout is unchanged from the
+parent.
 
 This function differs from other comparable "spawn" or "exec"
 functions in critical respects:

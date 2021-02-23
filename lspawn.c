@@ -47,6 +47,13 @@ extern const char **environ;
 #define luaL_pushfail(L_) lua_pushnil(L_)
 #endif
 
+enum spawn_op {
+	LSPAWN_CALL,
+	LSPAWN_WAIT,
+	LSPAWN_READFROM,
+	LSPAWN_WRITETO,
+};
+
 //==========================================================================
 
 //
@@ -441,30 +448,6 @@ static int
 file_act_err(lua_State *L, int err)
 {
 	return luaL_error(L, "error adding file action: %s", strerror(err));
-}
-
-// If no table of file actions was passed in, do the default thing.
-
-static int
-process_files_default(lua_State *L,
-					  spawn_file_actions_t *facts,
-					  int foreground_fd)
-{
-	if (foreground_fd >= 0)
-	{
-		if (foreground_fd > 2)
-			return file_act_err(L, ENOTTY);
-
-		int err = spawn_file_actions_addsetpgrp_np(facts, foreground_fd);
-		if (unlikely(err != 0))
-			return file_act_err(L, err);
-	}
-
-	int	err = spawn_file_actions_addclosefrom_np(facts, 3);
-	if (unlikely(err != 0))
-		return file_act_err(L, err);
-
-	return 0;
 }
 
 //
@@ -981,6 +964,75 @@ process_files(lua_State *L,
 	lua_pop(L, 1);
 	return 0;
 }
+
+// If no table of file actions was passed in, do the default thing.
+
+static void
+process_default_pipe(lua_State *L, int pipe_idx,
+					 spawn_file_actions_t *facts,
+					 enum spawn_op context)
+{
+	enum lspawn_fa_type fa_type = FA_INVALID;
+	int			pipe_child_fd = -1;
+	int			pipe_parent_fd;
+	int			err;
+
+	switch (context)
+	{
+		case LSPAWN_READFROM:
+			pipe_child_fd = 1;
+			fa_type = FA_OUTPIPE;
+			break;
+		case LSPAWN_WRITETO:
+			pipe_child_fd = 0;
+			fa_type = FA_INPIPE;
+			break;
+		default:
+			return;
+	}
+
+	if (pipe_idx == 0)
+		luaL_error(L, "pipes not permitted with wait or exec");
+
+	pipe_parent_fd = make_pipe(L, fa_type, pipe_idx);
+
+	err = spawn_file_actions_adddup2(facts, pipe_parent_fd, pipe_child_fd);
+	if (unlikely(err != 0))
+		file_act_err(L, err);
+
+	if (context == LSPAWN_READFROM)
+	{
+		err = spawn_file_actions_addopen(facts, 0, "/dev/null", O_RDWR, 0);
+		if (unlikely(err != 0))
+			file_act_err(L, err);
+	}
+}
+
+static int
+process_files_default(lua_State *L, int pipe_idx,
+					  spawn_file_actions_t *facts,
+					  enum spawn_op context,
+					  int foreground_fd)
+{
+	process_default_pipe(L, pipe_idx, facts, context);
+
+	if (foreground_fd >= 0)
+	{
+		if (foreground_fd > 2)
+			return file_act_err(L, ENOTTY);
+
+		int err = spawn_file_actions_addsetpgrp_np(facts, foreground_fd);
+		if (unlikely(err != 0))
+			return file_act_err(L, err);
+	}
+
+	int	err = spawn_file_actions_addclosefrom_np(facts, 3);
+	if (unlikely(err != 0))
+		return file_act_err(L, err);
+
+	return 0;
+}
+
 
 //==========================================================================
 
@@ -1883,10 +1935,6 @@ wait_for_proc(lua_State *L,
 
 // Actual main entry point.
 
-enum spawn_op {
-	LSPAWN_CALL,
-	LSPAWN_WAIT
-};
 
 static int
 lspawn_doit(lua_State *L, enum spawn_op context)
@@ -2109,7 +2157,9 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	}
 
 	if (lua_isnil(L, SIDX_FILES))
-		process_files_default(L, file_acts, foreground_fd);
+		process_files_default(L,
+							  (do_exec || do_wait) ? 0 : SIDX_PIPEOBJS,
+							  file_acts, context, foreground_fd);
 	else
 		process_files(L, SIDX_FILES,
 					  (do_exec || do_wait) ? 0 : SIDX_PIPEOBJS,
@@ -2198,14 +2248,15 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	if (do_wait)
 		return wait_for_proc(L, child_pid, &wait_ignore_sigs, &save_sigmask);
 
-	lua_pushinteger(L, child_pid);
+	if (context != LSPAWN_READFROM && context != LSPAWN_WRITETO)
+		lua_pushinteger(L, child_pid);
 
 	if (lua_type(L, SIDX_PIPEOBJS) != LUA_TNIL)
 	{
 		auto_closevar_release(L, SIDX_PIPEOBJS);
 		SPStream *sp = luaL_checkudata(L, -1, LUA_FILEHANDLE);
 		sp->pid = child_pid;
-		return 2;
+		return (context == LSPAWN_READFROM || context == LSPAWN_WRITETO) ? 1 : 2;
 	}
 
 	return 1;
@@ -2239,8 +2290,22 @@ lspawn_wait(lua_State *L)
 	return lspawn_doit(L, LSPAWN_WAIT);
 }
 
+static int
+lspawn_readfrom(lua_State *L)
+{
+	return lspawn_doit(L, LSPAWN_READFROM);
+}
+
+static int
+lspawn_writeto(lua_State *L)
+{
+	return lspawn_doit(L, LSPAWN_WRITETO);
+}
+
 static luaL_Reg lspawn_funcs[] = {
 	{ "wait", lspawn_wait },
+	{ "read_from", lspawn_readfrom },
+	{ "write_to", lspawn_writeto },
 	{ NULL, NULL }
 };
 
