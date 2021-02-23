@@ -296,3 +296,11 @@ wait for the subprocess to terminate when the handle is closed.
 own pipes using the posix module and pass the appropriate
 descriptors.)
 
+Auxiliary functions
+----
+
+As a convenience, the module also provides:
+
+	flag, status, code = spawn.waitpid(pid)
+
+with the obvious meaning.

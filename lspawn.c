@@ -56,6 +56,49 @@ enum spawn_op {
 
 //==========================================================================
 
+// This ought to be luaL_execresult, but in 5.4 that is broken due to a very
+// misguided attempt at windows compatibility. But while we're here, fix the
+// exit code.
+
+static int
+my_execresult(lua_State *L, int status)
+{
+	bool		exited = WIFEXITED(status);
+	bool		signaled = WIFSIGNALED(status);
+	lua_pushboolean(L, exited && (WEXITSTATUS(status) == 0));
+	lua_pushstring(L, signaled ? "signal" : "exit");
+	lua_pushinteger(L, status);
+	return 3;
+}
+
+static int
+my_errresult(lua_State *L, int err)
+{
+	luaL_pushfail(L);
+	lua_pushstring(L, strerror(err));
+	lua_pushinteger(L, err);
+	return 3;
+}
+
+static int
+do_waitpid(lua_State *L, pid_t cpid)
+{
+	int			status = -1;
+	pid_t		rpid;
+
+	do
+		rpid = waitpid(cpid, &status, 0);
+	while (rpid == -1 && errno == EINTR);
+
+	if (rpid == cpid)
+		return my_execresult(L, status);
+	else if (rpid >= 0)
+		return luaL_error(L, "waitpid returned wrong pid: expected %ld got %ld",
+						  (long)cpid, (long)rpid);
+	else
+		return my_errresult(L, errno);
+}
+
 //
 // Lua container convenience functions.
 //
@@ -474,11 +517,7 @@ spawn_pipe_close(lua_State *L)
 		s->lstr.f = NULL;
 	}
 	if (s->pid != -1)
-	{
-		int status = -1;
-		waitpid(s->pid, &status, 0);
-		return luaL_execresult(L, status);
-	}
+		return do_waitpid(L, s->pid);
 	else
 		return 0;
 }
@@ -1871,29 +1910,6 @@ lspawn_call_do_args(lua_State *L, int idx)
 	lua_pop(L, 1);
 }
 
-// This ought to be luaL_execresult, but in 5.4 that is broken due to a very
-// misguided attempt at windows compatibility.
-
-static int
-my_execresult(lua_State *L, int status)
-{
-	bool		exited = WIFEXITED(status);
-	bool		signaled = WIFSIGNALED(status);
-	lua_pushboolean(L, exited && (WEXITSTATUS(status) == 0));
-	lua_pushstring(L, signaled ? "signal" : "exit");
-	lua_pushinteger(L, status);
-	return 3;
-}
-
-static int
-my_errresult(lua_State *L, int err)
-{
-	luaL_pushfail(L);
-	lua_pushstring(L, strerror(err));
-	lua_pushinteger(L, err);
-	return 3;
-}
-
 static int
 wait_for_proc(lua_State *L,
 			  pid_t child_pid,
@@ -2302,8 +2318,19 @@ lspawn_writeto(lua_State *L)
 	return lspawn_doit(L, LSPAWN_WRITETO);
 }
 
+static int
+lspawn_waitpid(lua_State *L)
+{
+	pid_t pid = (pid_t) luaL_checkinteger(L, 1);
+
+	luaL_argcheck(L, (lua_gettop(L) == 1), 2, "none expected");
+
+	return do_waitpid(L, pid);
+}
+
 static luaL_Reg lspawn_funcs[] = {
 	{ "wait", lspawn_wait },
+	{ "waitpid", lspawn_waitpid },
 	{ "read_from", lspawn_readfrom },
 	{ "write_to", lspawn_writeto },
 	{ NULL, NULL }
