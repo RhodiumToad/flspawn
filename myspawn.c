@@ -125,6 +125,10 @@ extern int _setrlimit(int rlim, const struct rlimit *val);
 extern int _stat(const char *, struct stat *);
 extern int _waitpid(pid_t, int *, int);
 
+#ifdef COVERAGE
+extern void __gcov_flush(void);
+#endif
+
 #define STR_WITH_LEN(s_) (s_), sizeof(s_)-1
 
 /* private data structs */
@@ -235,6 +239,7 @@ struct spawn_args {
     sigset_t vfmask;
     bool is_vfork;
 	bool verbose;
+	bool is_exec;
     volatile int error;
 };
 
@@ -409,7 +414,7 @@ process_spawnattr(struct spawn_args *psa)
 
     /* Set session */
     if (sa->sa_flags & SPAWN_SETSID)
-		if (setsid() != 0)
+		if (setsid() < 0)
 			return report_err(psa, errno, "setsid", NULL);
 
     /* Set process group */
@@ -789,6 +794,10 @@ _spawn_thr(void *data)
 
 	if (!err)
 	{
+#ifdef COVERAGE
+		if (psa->is_exec)
+			__gcov_flush();
+#endif
 		if (psa->path)
 			execvPe(psa->file, psa->path, psa->argv, psa->envp);
 		else
@@ -843,6 +852,7 @@ spawnP(pid_t *pidp,
 	psa.envp = envp ? envp : environ;
 	psa.path = path;
 	psa.is_vfork = false;
+	psa.is_exec = false;
 	psa.verbose = sa && (*sa)->sa_flags & SPAWN_VERBOSE_NP;
 	psa.error = 0;
 
@@ -1033,6 +1043,7 @@ spawnexecP(const char *file,
 
 	/* Pretend we did a vfork. */
 	psa.is_vfork = true;
+	psa.is_exec = true;
 
 	sigfillset(&allsigs);
 	if (__isthreaded)

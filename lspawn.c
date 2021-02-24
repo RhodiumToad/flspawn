@@ -397,7 +397,7 @@ lspawn_fa_make_inherit_from(lua_State *L)
 	int			fd = lua_tointegerx(L, 1, &isint);
 	luaL_Stream *fp = luaL_testudata(L, 1, LUA_FILEHANDLE);
 
-	luaL_argcheck(L, ((isint && fd >= 0) || (fp && fp->f && !fp->closef)),
+	luaL_argcheck(L, ((isint && fd >= 0) || (fp && fp->f && fp->closef)),
 				  1, "expected integer fd or open file");
 
 	if (!fp)
@@ -412,7 +412,7 @@ lspawn_fa_make_copy_from(lua_State *L)
 {
 	int			fd = luaL_checkinteger(L, 1);
 
-	return lspawn_fa_new(L, FA_INHERIT, fd, 0);
+	return lspawn_fa_new(L, FA_COPY_FROM, fd, 0);
 }
 
 // This does nothing. It simply means that, e.g. spawn.null and spawn.null()
@@ -990,7 +990,7 @@ process_files(lua_State *L,
 			p = to_object(L, -1, &lspawn_file_action_meta);
 			if (p && p->type == FA_COPY_FROM)
 			{
-				err = spawn_file_actions_adddup2(facts, p->value1, 1);
+				err = spawn_file_actions_adddup2(facts, p->value1, i);
 				if (unlikely(err != 0))
 					return file_act_err(L, err);
 			}
