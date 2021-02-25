@@ -58,8 +58,7 @@ enum spawn_op {
 //==========================================================================
 
 // This ought to be luaL_execresult, but in 5.4 that is broken due to a very
-// misguided attempt at windows compatibility. But while we're here, fix the
-// exit code.
+// misguided attempt at windows compatibility.
 
 static int
 my_execresult(lua_State *L, int status)
@@ -2390,10 +2389,12 @@ static luaL_Reg lspawn_funcs[] = {
 
 // Library initialization.
 
-EXPORTED int luaopen_lspawn(lua_State *);
+#define MODENTRY CONCAT(luaopen_,MODNAME)
+
+EXPORTED int MODENTRY(lua_State *);
 
 int
-luaopen_lspawn(lua_State *L)
+MODENTRY(lua_State *L)
 {
 	lua_settop(L, 0);
 

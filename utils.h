@@ -45,6 +45,9 @@
 
 #define countof(x) ((ssize_t)(sizeof(x) / sizeof((x)[0])))
 
+#define CONCAT2(x,y) x##y
+#define CONCAT(x,y) CONCAT2(x,y)
+
 #if defined(LUA_VERSION_NUM) && defined(LUA_API)
 LUA_API int   (lua_error) (lua_State *L) NO_RETURN;
 #endif

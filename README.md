@@ -1,14 +1,14 @@
 
-lspawn
-======
+flspawn
+=======
 
-NOTE: the name `lspawn` is provisional and may be changed in the
+NOTE: the name `flspawn` is provisional and may be changed in the
 future.
 
 All examples in this file assume the module has been loaded as
 follows:
 
-	local spawn = require 'lspawn'
+	local spawn = require 'flspawn'
 
 Simplified usage
 ----
