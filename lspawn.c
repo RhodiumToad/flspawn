@@ -31,6 +31,7 @@
 #include "myspawn.h"
 #include "simple_class.h"
 #include "auto_close.h"
+#include "get_nfiles.h"
 #include "utils.h"
 
 extern const char **environ;
@@ -2328,9 +2329,58 @@ lspawn_waitpid(lua_State *L)
 	return do_waitpid(L, pid);
 }
 
+static int
+lspawn_open_fds(lua_State *L)
+{
+	lua_settop(L, 0);
+	lua_createtable(L, 4, 0);
+
+	int nfds = get_nfiles();
+	int maxfd = getdtablesize();
+	int idx = 0;
+
+	for (int fd = 0; fd < maxfd; ++fd)
+	{
+		if (fcntl(fd, F_GETFD, 0) != -1)
+		{
+			lua_pushinteger(L, fd);
+			lua_rawseti(L, 1, ++idx);
+			if (idx == nfds)
+				break;
+		}
+	}
+
+	return 1;
+}
+
+static int
+lspawn_environ(lua_State *L)
+{
+	lua_settop(L, 0);
+	lua_createtable(L, 0, 64);
+
+	for (int i = 0; environ[i]; ++i)
+	{
+		const char *name = environ[i];
+		const char *eq = strchr(name, '=');
+
+		if (!eq || name == eq)
+			continue;
+
+		lua_pushlstring(L, name, (size_t)(eq - name));
+		lua_pushstring(L, eq + 1);
+		lua_rawset(L, 1);
+	}
+
+	return 1;
+}
+
+
 static luaL_Reg lspawn_funcs[] = {
 	{ "wait", lspawn_wait },
 	{ "waitpid", lspawn_waitpid },
+	{ "open_fds", lspawn_open_fds },
+	{ "environ", lspawn_environ },
 	{ "read_from", lspawn_readfrom },
 	{ "write_to", lspawn_writeto },
 	{ NULL, NULL }

@@ -303,4 +303,14 @@ As a convenience, the module also provides:
 
 	flag, status, code = spawn.waitpid(pid)
 
-with the obvious meaning.
+with the obvious meaning;
+
+	envtab = spawn.environ()
+
+which returns a (newly generated each time) table containing a copy of
+the current environment of the process; and
+
+	fdtab = spawn.open_fds()
+
+which returns a table containing the list of currently open fds as a
+sequence.
