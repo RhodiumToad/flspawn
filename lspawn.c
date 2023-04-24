@@ -57,6 +57,40 @@ enum spawn_op {
 
 //==========================================================================
 
+// Convenience functions for getting 'int' rather than lua_Integer values
+
+static int
+to_intx(lua_State *L, int idx, int *isint)
+{
+	lua_Integer res = lua_tointegerx(L, idx, isint);
+	if (!*isint)
+		return 0;
+	if (res < INT_MIN || res > INT_MAX)
+	{
+		*isint = 0;
+		return 0;
+	}
+	return res;
+}
+
+static int
+opt_int(lua_State *L, int idx, int def)
+{
+	lua_Integer res = luaL_optinteger(L, idx, def);
+	if (res < INT_MIN || res > INT_MAX)
+		return luaL_argerror(L, idx, "integer argument out of range");
+	return res;
+}
+
+static int
+check_int(lua_State *L, int idx)
+{
+	lua_Integer res = luaL_checkinteger(L, idx);
+	if (res < INT_MIN || res > INT_MAX)
+		return luaL_argerror(L, idx, "integer argument out of range");
+	return res;
+}
+
 // This ought to be luaL_execresult, but in 5.4 that is broken due to a very
 // misguided attempt at windows compatibility.
 
@@ -113,10 +147,13 @@ do_waitpid(lua_State *L, pid_t cpid)
 // respecting metamethods.
 //
 
+// try and organize these to minimize api calls in the common case of a plain
+// table.
+
 static bool
-is_indexable(lua_State *L, int nd)
+is_indexable(lua_State *L, int nd, int typ)
 {
-	if (lua_type(L, nd) == LUA_TTABLE)
+	if (typ == LUA_TTABLE)
 		return true;
 	if (luaL_getmetafield(L, nd, "__index") != LUA_TNIL)
 	{
@@ -127,18 +164,18 @@ is_indexable(lua_State *L, int nd)
 }
 
 static bool
-is_container(lua_State *L, int nd)
+is_container(lua_State *L, int nd, int typ)
 {
-	if (luaL_getmetafield(L, nd, "__pairs") != LUA_TNIL)
-	{
-		lua_pop(L, 1);
-		return true;
-	}
-	if (lua_type(L, nd) == LUA_TTABLE)
+	if (typ == LUA_TTABLE)
 	{
 		if (luaL_getmetafield(L, nd, "__index") == LUA_TNIL)
 			return true;
 		lua_pop(L, 1);
+	}
+	if (luaL_getmetafield(L, nd, "__pairs") != LUA_TNIL)
+	{
+		lua_pop(L, 1);
+		return true;
 	}
 	return false;
 }
@@ -346,8 +383,11 @@ lspawn_fa_make_outpipe(lua_State *L)
 static int
 lspawn_fileflags(lua_State *L, int idx)
 {
-	if (lua_isinteger(L, idx))
-		return lua_tointeger(L, idx);
+	int isint = 0;
+	int val = to_intx(L, idx, &isint);
+
+	if (isint)
+		return val;
 	else if (lua_isstring(L, idx))
 	{
 		const char *modestr = lua_tostring(L, idx);
@@ -380,7 +420,7 @@ static int
 lspawn_fa_make_open(lua_State *L)
 {
 	int			flags = lspawn_fileflags(L, 2);
-	int			perms = luaL_optinteger(L, 3, 0666);
+	int			perms = opt_int(L, 3, 0666);
 
 	luaL_checkstring(L, 1);
 
@@ -394,7 +434,7 @@ static int
 lspawn_fa_make_inherit_from(lua_State *L)
 {
 	int			isint = 0;
-	int			fd = lua_tointegerx(L, 1, &isint);
+	int			fd = to_intx(L, 1, &isint);
 	luaL_Stream *fp = luaL_testudata(L, 1, LUA_FILEHANDLE);
 
 	luaL_argcheck(L, ((isint && fd >= 0) || (fp && fp->f && fp->closef)),
@@ -410,7 +450,9 @@ lspawn_fa_make_inherit_from(lua_State *L)
 static int
 lspawn_fa_make_copy_from(lua_State *L)
 {
-	int			fd = luaL_checkinteger(L, 1);
+	int			fd = check_int(L, 1);
+
+	luaL_argcheck(L, (fd >= 0), 1, "expected integer fd");
 
 	return lspawn_fa_new(L, FA_COPY_FROM, fd, 0);
 }
@@ -516,7 +558,7 @@ spawn_pipe_close(lua_State *L)
 		fclose(s->lstr.f);
 		s->lstr.f = NULL;
 	}
-	if (s->pid != -1)
+	if (s->pid > 0)
 		return do_waitpid(L, s->pid);
 	else
 		return 0;
@@ -620,10 +662,25 @@ make_pipe(lua_State *L,
 
 // Do all the hairy file juggling stuff.
 
+static void check_dtable_overflow(lua_State *L, int maxfd)
+{
+	NO_WARN_CONSTANT_COMPARE_BEGIN;
+
+	if (maxfd > INT_MAX - 2
+		|| (unsigned)maxfd >= SIZE_MAX - 2
+//		|| (size_t)maxfd != (unsigned)maxfd
+//		|| (size_t)maxfd >= SIZE_MAX - 2
+		|| (SIZE_MAX / sizeof(int)) < (size_t)maxfd + (size_t)2)
+		luaL_argerror(L, 1, "file descriptor too large");
+
+	NO_WARN_CONSTANT_COMPARE_END;
+}
+
 static int
 process_files(lua_State *L,
 			  int ftab_idx, int pipe_idx,
 			  spawn_file_actions_t *facts,
+			  int fd_clamp,
 			  int foreground_fd)
 {
 	int			err;
@@ -664,9 +721,11 @@ process_files(lua_State *L,
 	{
 		// stack: [ initfunc \ state \ ] \ key \ value
 		int isint = 0;
-		int fd_out = lua_tointegerx(L, -2, &isint);
-		if (!isint || fd_out < 0)
-			return luaL_argerror(L, 1, "bad entry in files table, expected integer key >= 0");
+		lua_Integer fd_out = lua_tointegerx(L, -2, &isint);
+		if (!isint || fd_out < 0 || !(INT_MAX > fd_out))
+			return luaL_argerror(L, 1, "bad entry in files table, expected integer key >= 0 and < INT_MAX");
+		if (fd_out >= fd_clamp)
+			return luaL_argerror(L, 1, "bad entry in files table, descriptor exceeds resource limit");
 		if (fd_out > hiwat_out)
 			hiwat_out = fd_out;
 		if (metaloop)
@@ -681,11 +740,18 @@ process_files(lua_State *L,
 	if (metaloop)
 		ftab_idx = tmpt_idx;
 
-	// Allocate a buffer (which we will abandon to the garbage collector)
-	// if there are more fds than we're prepared to accomodate on the stack.
+	// Allocate a buffer (which we will abandon to the garbage collector) if
+	// there are more fds than we're prepared to accomodate on the stack.
+	// Sanity-check the file descriptor range first: we need to be able to
+	// allocate one extra descriptor, the highest descriptor must be strictly
+	// less than INT_MAX, and the memory for a table of integers must be
+	// allocatable (fits in size_t). (We already failed any attempt to specify
+	// a descriptor >= INT_MAX.)
 
-	if (hiwat_out + 1 >= countof(map_out_buf))
-		map_out_to_in = lua_newuserdata(L, (unsigned)(hiwat_out + 2) * sizeof(int));
+	check_dtable_overflow(L, hiwat_out);
+
+	if (hiwat_out >= countof(map_out_buf) - 1)
+		map_out_to_in = lua_newuserdata(L, (size_t)(hiwat_out + 2) * sizeof(int));
 	else
 		map_out_to_in = map_out_buf;
 
@@ -695,7 +761,10 @@ process_files(lua_State *L,
 	hiwat_in = hiwat_out;
 
 	// For each output fd, find its input fd and build the out->in map. Find
-	// the input high-water-mark in the process.
+	// the input high-water-mark in the process. We use three special values
+	// in the map: -1 means no entry present, -2 means an entry was processed
+	// in a way that left an open fd, and -3 means a copy_from entry is
+	// present.
 
 	for (int i = 0; i <= hiwat_out; ++i)
 	{
@@ -731,6 +800,9 @@ process_files(lua_State *L,
 							pipe_parent_fd = make_pipe(L, fa_type, pipe_idx);
 							pipe_child_fd = i;
 							fd_in = pipe_parent_fd;
+							break;
+						case FA_COPY_FROM:
+							map_out_to_in[i] = -3;
 							break;
 						default:
 							break;
@@ -769,15 +841,18 @@ process_files(lua_State *L,
 		lua_pop(L, 1);
 	}
 
-	if (hiwat_in + 1 >= countof(map_in_buf))
-		map_in_counts = lua_newuserdata(L, (unsigned)(hiwat_in + 2) * sizeof(int));
+	check_dtable_overflow(L, hiwat_in);
+
+	if (hiwat_in >= countof(map_in_buf) - 1)
+		map_in_counts = lua_newuserdata(L, (size_t)(hiwat_in + 2) * sizeof(int));
 	else
 		map_in_counts = map_in_buf;
 
-	for (int i = 0; i <= hiwat_in + 1; ++i)
+	for (int i = 0; i <= hiwat_in; ++i)
 		map_in_counts[i] = 0;
 	for (int i = 0; i <= hiwat_out; ++i)
-		map_in_counts[map_out_to_in[i]] += 1;
+		if (map_out_to_in[i] >= 0)
+			map_in_counts[map_out_to_in[i]] += 1;
 
 	// Find the lowest free fd to use for staging.
 
@@ -807,37 +882,40 @@ process_files(lua_State *L,
 	// cycles, so choose any node, break the cycle at that node,
 	// and repeat until done.
 
-	for (;;)
+	for (int lowbound = 0;;)
 	{
 		int n = 0;
-		for (dst = 0; dst <= hiwat_out; ++dst)
+		int break_here = hiwat_out + 1;
+		for (dst = lowbound; dst <= hiwat_out; ++dst)
 		{
 			int src = map_out_to_in[dst];
-			if ((map_in_counts[dst] == 0 && src >= 0)
-				|| (src == dst))
+			if (src >= 0)
 			{
-				err = spawn_file_actions_adddup2(facts, src, dst);
-				if (unlikely(err != 0))
-					return file_act_err(L, err);
-				map_in_counts[src] -= 1;
-				map_out_to_in[dst] = -1;
-				++n;
+				if (map_in_counts[dst] == 0 || src == dst)
+				{
+					err = spawn_file_actions_adddup2(facts, src, dst);
+					if (unlikely(err != 0))
+						return file_act_err(L, err);
+					map_in_counts[src] -= 1;
+					map_out_to_in[dst] = -2;
+					++n;
+				}
+				else if (break_here > dst)
+					break_here = dst;
 			}
 		}
-		if (n)
+		lowbound = break_here;
+		if (n > 0)
 			continue;
-		for (dst = 0; dst <= hiwat_out; ++dst)
-			if (map_out_to_in[dst] >= 0)
-				break;
-		if (dst > hiwat_out)
+		if (break_here > hiwat_out)
 			break;
-		int src = map_out_to_in[dst];
+		int src = map_out_to_in[break_here];
 		err = spawn_file_actions_adddup2(facts, src, free_fd);
 		if (unlikely(err != 0))
 			return file_act_err(L, err);
 		map_in_counts[src] = 0;
 		map_in_counts[free_fd] = 1;
-		map_out_to_in[dst] = free_fd;
+		map_out_to_in[break_here] = free_fd;
 	}
 
 	// We're done with any input files that have not been copied
@@ -891,6 +969,7 @@ process_files(lua_State *L,
 				lua_getuservalue(L, -1);
 				const char *fname = lua_tostring(L, -1);
 				err = spawn_file_actions_addopen(facts, foreground_fd, fname, p->value1, (mode_t) p->value2);
+				map_out_to_in[foreground_fd] = -2;
 				// addopen copied the filename so we don't need to keep it on stack
 				lua_pop(L, 1);
 				break;
@@ -960,12 +1039,14 @@ process_files(lua_State *L,
 				}
 				else
 					err = spawn_file_actions_adddup2(facts, nullfd, i);
+				map_out_to_in[i] = -2;
 				break;
 			case FA_OPEN:
 			{
 				lua_getuservalue(L, -1);
 				const char *fname = lua_tostring(L, -1);
 				err = spawn_file_actions_addopen(facts, i, fname, p->value1, (mode_t) p->value2);
+				map_out_to_in[i] = -2;
 				// addopen copied the filename so we don't need to keep it on stack
 				lua_pop(L, 1);
 				break;
@@ -990,7 +1071,12 @@ process_files(lua_State *L,
 			p = to_object(L, -1, &lspawn_file_action_meta);
 			if (p && p->type == FA_COPY_FROM)
 			{
-				err = spawn_file_actions_adddup2(facts, p->value1, i);
+				int from_fd = p->value1;
+				if (from_fd < 0 || from_fd > hiwat_out || map_out_to_in[from_fd] > -2)
+					return luaL_argerror(L, 1, "copy_from must refer to an open file");
+				if (map_out_to_in[from_fd] == -3)
+					return luaL_argerror(L, 1, "copy_from must not refer to a copy_from");
+				err = spawn_file_actions_adddup2(facts, from_fd, i);
 				if (unlikely(err != 0))
 					return file_act_err(L, err);
 			}
@@ -1000,7 +1086,7 @@ process_files(lua_State *L,
 	}
 
 	// pop the temp table slot
-	lua_pop(L, 1);
+	lua_settop(L, tmpt_idx-1);
 	return 0;
 }
 
@@ -1313,14 +1399,15 @@ process_siglist(lua_State *L,
 				sigset_t *sigs_add, sigset_t *sigs_del)
 {
 	int			argt;
+	int			typ = lua_getfield(L, sigt_idx, name);
 
-	if (lua_getfield(L, sigt_idx, name) == LUA_TNIL)
+	if (typ == LUA_TNIL)
 	{
 		lua_pop(L, 1);
 		return false;
 	}
 
-	if (!is_indexable(L, -1))
+	if (!is_indexable(L, -1, typ))
 		return luaL_error(L, "bad signal %s table, expected indexable value", name);
 
 	for (int i = 1; (argt = lua_geti(L, -1, i)) != LUA_TNIL; ++i)
@@ -1331,7 +1418,7 @@ process_siglist(lua_State *L,
 
 		if (argt != LUA_TNUMBER)
 			argt = lua_rawget(L, lua_upvalueindex(3));
-		sig = lua_tointegerx(L, -1, &isint);
+		sig = to_intx(L, -1, &isint);
 		if (isint)
 		{
 			if (sigs_add)
@@ -1599,7 +1686,7 @@ rv_getvalue(lua_State *L, int res, int vtype)
 		{
 			int isint = 0;
 			lua_Integer val = lua_tointegerx(L, -1, &isint);
-			if (isint)
+			if (isint && val >= 0)
 				return val;
 			lua_Number nval = lua_tonumber(L, -1);
 			if (nval > 0 && isinf(nval))
@@ -1646,7 +1733,7 @@ process_resources(lua_State *L, int idx, bool *rlim_set, struct rlimit *rlims)
 			rlims[res].rlim_max = limval;
 			rlim_set[res] = result = true;
 		}
-		else if (is_indexable(L, -1))
+		else if (is_indexable(L, -1, vtype))
 		{
 			int	vtype1 = lua_getfield(L, -1, "cur");
 			if (vtype1 == LUA_TNIL)
@@ -1786,22 +1873,22 @@ static const char *v_string(lua_State *L, int typ)
 }
 static const char *v_indexable(lua_State *L, int typ)
 {
-	return is_indexable(L, -1) ? NULL : "table or indexable object";
+	return is_indexable(L, -1, typ) ? NULL : "table or indexable object";
 }
 static const char *v_container(lua_State *L, int typ)
 {
-	return is_container(L, -1) ? NULL : "table or container";
+	return is_container(L, -1, typ) ? NULL : "table or container";
 }
 static const char *v_integer(lua_State *L, int typ)
 {
 	int isint = 0;
-	lua_tointegerx(L, -1, &isint);
+	to_intx(L, -1, &isint);			// "integer" here means int, not lua_Integer
 	return isint ? NULL : "integer";
 }
 static const char *v_int_or_bool(lua_State *L, int typ)
 {
 	int isint = 0;
-	lua_tointegerx(L, -1, &isint);
+	to_intx(L, -1, &isint);			// "integer" here means int, not lua_Integer
 	return (typ == LUA_TBOOLEAN || isint) ? NULL : "integer or boolean";
 }
 static const char *v_str_or_bool(lua_State *L, int typ)
@@ -1871,7 +1958,7 @@ lspawn_call_do_args(lua_State *L, int idx)
 	lua_pushnil(L);
 	while (lua_next(L, lua_upvalueindex(1)))
 	{
-		int i = lua_tointeger(L, -1);
+		int i = lua_tointeger(L, -1);		// trusted source
 
 		lua_copy(L, -2, -1);
 		int argt = lua_gettable(L, idx);
@@ -1894,7 +1981,7 @@ lspawn_call_do_args(lua_State *L, int idx)
 
 	// Check the original arg table for spurious keys.
 
-	lua_pushnil(L);
+	lua_pushnil(L);		// toclose slot
 
 	bool metaloop = pairs_start(L, idx, lua_absindex(L, -1), true);
 	while (metaloop ? pairs_next(L) : lua_next(L, idx))
@@ -1979,6 +2066,8 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	bool		do_wait = (context == LSPAWN_WAIT);
 	bool		inherit_env = true;
 	int			foreground_fd = -1;
+	int			fd_clamp = getdtablesize();
+
 	const char *filename;
 	const char *search_path = NULL;
 	const char *errprefix = NULL;
@@ -2103,8 +2192,22 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 		rlim_set[res] = false;
 
 	if (!lua_isnil(L, SIDX_RESOURCES))
+	{
 		if (process_resources(L, SIDX_RESOURCES, rlim_set, rlim))
 			spawn_attr_flags |= SPAWN_SETRLIMITS_NP;
+
+		if (rlim_set[RLIMIT_NOFILE])
+		{
+			fd_clamp = get_maxfilesperproc();
+			if (fd_clamp < 0)
+				return luaL_error(L, "get_maxfilesperproc: %s", strerror(errno));
+
+			if (fd_clamp > rlim[RLIMIT_NOFILE].rlim_max)
+				fd_clamp = rlim[RLIMIT_NOFILE].rlim_max;
+			if (fd_clamp > rlim[RLIMIT_NOFILE].rlim_cur)
+				fd_clamp = rlim[RLIMIT_NOFILE].rlim_cur;
+		}
+	}
 
 	lua_settop(L, SIDX__DROP1);
 
@@ -2179,7 +2282,7 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	else
 		process_files(L, SIDX_FILES,
 					  (do_exec || do_wait) ? 0 : SIDX_PIPEOBJS,
-					  file_acts, foreground_fd);
+					  file_acts, fd_clamp, foreground_fd);
 
 	if (jail_after >= 0)
 	{
@@ -2282,7 +2385,7 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 static int lspawn_call(lua_State *L);
 
 static RegMeta lspawn_lib_meta = {
-	.name = "lspawn library",
+	.name = STRINGIFY(MODNAME) " library version " STRINGIFY(MODVERS),
 	.metamethods = (luaL_Reg[]){
 		{ "__call", lspawn_call },
 		{ NULL, NULL }
@@ -2321,7 +2424,7 @@ lspawn_writeto(lua_State *L)
 static int
 lspawn_waitpid(lua_State *L)
 {
-	pid_t pid = (pid_t) luaL_checkinteger(L, 1);
+	pid_t pid = (pid_t) check_int(L, 1);
 
 	luaL_argcheck(L, (lua_gettop(L) == 1), 2, "none expected");
 
@@ -2331,13 +2434,19 @@ lspawn_waitpid(lua_State *L)
 static int
 lspawn_open_fds(lua_State *L)
 {
-	lua_settop(L, 0);
+	luaL_argcheck(L, (lua_gettop(L) == 0), 1, "none expected");
+
 	lua_createtable(L, 4, 0);
 
 	int nfds = get_nfiles();
-	int maxfd = getdtablesize();
-	int idx = 0;
+	if (nfds < 0)
+		return luaL_error(L, "get_nfiles: %s", strerror(errno));
 
+	int maxfd = get_maxfilesperproc();
+	if (maxfd < 0)
+		return luaL_error(L, "get_maxfilesperproc: %s", strerror(errno));
+
+	int idx = 0;
 	for (int fd = 0; fd < maxfd; ++fd)
 	{
 		if (fcntl(fd, F_GETFD, 0) != -1)
@@ -2349,6 +2458,37 @@ lspawn_open_fds(lua_State *L)
 		}
 	}
 
+	return 1;
+}
+
+static int
+lspawn_dtablesize(lua_State *L)
+{
+	luaL_argcheck(L, (lua_gettop(L) == 0), 1, "none expected");
+
+	lua_pushinteger(L, getdtablesize());
+	return 1;
+}
+
+static int
+lspawn_maxfilesperproc(lua_State *L)
+{
+	luaL_argcheck(L, (lua_gettop(L) == 0), 1, "none expected");
+
+	int maxfd = get_maxfilesperproc();
+	if (maxfd < 0)
+		return luaL_error(L, "get_maxfilesperproc: %s", strerror(errno));
+
+	lua_pushinteger(L, maxfd);
+	return 1;
+}
+
+static int
+lspawn_version(lua_State *L)
+{
+	luaL_argcheck(L, (lua_gettop(L) == 0), 1, "none expected");
+
+	lua_pushliteral(L, STRINGIFY(MODVERS));
 	return 1;
 }
 
@@ -2376,11 +2516,14 @@ lspawn_environ(lua_State *L)
 
 
 static luaL_Reg lspawn_funcs[] = {
+	{ "dtablesize", lspawn_dtablesize },
+	{ "environ", lspawn_environ },
+	{ "maxfilesperproc", lspawn_maxfilesperproc },
+	{ "open_fds", lspawn_open_fds },
+	{ "read_from", lspawn_readfrom },
+	{ "version", lspawn_version },
 	{ "wait", lspawn_wait },
 	{ "waitpid", lspawn_waitpid },
-	{ "open_fds", lspawn_open_fds },
-	{ "environ", lspawn_environ },
-	{ "read_from", lspawn_readfrom },
 	{ "write_to", lspawn_writeto },
 	{ NULL, NULL }
 };

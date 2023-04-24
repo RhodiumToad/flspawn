@@ -1,8 +1,9 @@
 
 MODNAME = flspawn
+MODVERS = 1.1
 
 LUA_INCDIR?= /usr/local/include/lua54
-CPPFLAGS = -I$(LUA_INCDIR) -DMODNAME=$(MODNAME)
+CPPFLAGS = -I$(LUA_INCDIR) -DMODNAME=$(MODNAME) -DMODVERS=$(MODVERS)
 WARNFLAGS = -Wall -Wextra -Wimplicit-fallthrough -Wno-unused-parameter
 WERROR = -Werror
 COPT = -O2

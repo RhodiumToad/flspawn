@@ -11,6 +11,18 @@
 #ifndef __has_attribute
 #define __has_attribute(x_) 0
 #endif
+#ifndef __has_warning
+#define __has_warning(x_) 0
+#endif
+
+#ifdef __clang__
+#define W_CONSTANT_COMPARE_ "GCC diagnostic ignored \"-Wtautological-constant-out-of-range-compare\""
+#else
+#define W_CONSTANT_COMPARE_ "GCC diagnostic ignored \"-Wtype-limits\""
+#endif
+
+#define NO_WARN_CONSTANT_COMPARE_BEGIN _Pragma("GCC diagnostic push") _Pragma(W_CONSTANT_COMPARE_)
+#define NO_WARN_CONSTANT_COMPARE_END _Pragma("GCC diagnostic pop")
 
 #if !defined(__builtin_expect) && !defined(__GNUC__) && !__has_builtin(__builtin_expect)
 #define __builtin_expect(x_,y_) (x_)
@@ -47,6 +59,8 @@
 
 #define CONCAT2(x,y) x##y
 #define CONCAT(x,y) CONCAT2(x,y)
+#define STRINGIFY2(a_) #a_
+#define STRINGIFY(a_) STRINGIFY2(a_)
 
 #if defined(LUA_VERSION_NUM) && defined(LUA_API)
 LUA_API int   (lua_error) (lua_State *L) NO_RETURN;
