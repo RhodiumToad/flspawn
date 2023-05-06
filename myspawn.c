@@ -162,15 +162,21 @@ typedef struct spawn_file_actions_entry {
 		FAE_CHDIR,
 		FAE_FCHDIR,
 		FAE_SETPGRP,
-		FAE_JAIL
-	}			fae_action;
-
+		FAE_JAIL,
+		FAE_INVALID2 = 32767
+	} __packed		fae_action;
+    mode_t		fae_mode;
     int			fae_fildes;
-    char	   *fae_path;
     int			fae_atfd;
     int			fae_oflag;
-    mode_t		fae_mode;
 } spawn_file_actions_entry_t;
+
+__inline
+static char *
+fae_path(spawn_file_actions_entry_t *fae)
+{
+	return (char *)(fae + 1);
+}
 
 /*
  * We (noinline) most of these because controlling stack usage is more
@@ -247,20 +253,22 @@ __noinline
 static int
 really_report(struct spawn_args *psa, int err, const char *what, const char *arg)
 {
-	const char *estr = err < sys_nerr && sys_errlist[err] ? sys_errlist[err] : "unknown error";
+	const char *estr = ((err > 0 && err < sys_nerr && sys_errlist[err])
+						? sys_errlist[err]
+						: "unknown error");
 	size_t estr_len = strlen(estr);
 	static const char *const sep = ": ";
 	static const char *const nel = "\n";
 	const char *errprefix = psa->sa ? (*psa->sa)->sa_errprefix : NULL;
 	struct iovec iov[8] = {
-		{ .iov_base = __DECONST(void *, errprefix), .iov_len = errprefix ? strlen(errprefix) : 0 },
-		{ .iov_base = __DECONST(void *, sep),  .iov_len = 2 },
-		{ .iov_base = __DECONST(void *, what), .iov_len = strlen(what) },
-		{ .iov_base = __DECONST(void *, sep),  .iov_len = 2 },
-		{ .iov_base = __DECONST(void *, arg ? arg : estr), .iov_len = arg ? strlen(arg) : estr_len },
-		{ .iov_base = __DECONST(void *, arg ? sep : nel),  .iov_len = arg ? 2 : 1 },
-		{ .iov_base = __DECONST(void *, estr), .iov_len = estr_len },
-		{ .iov_base = __DECONST(void *, nel), .iov_len = 1 }
+		{ .iov_base = __DECONST(void *, errprefix),			.iov_len = errprefix ? strlen(errprefix) : 0 },
+		{ .iov_base = __DECONST(void *, sep),				.iov_len = 2 },
+		{ .iov_base = __DECONST(void *, what),				.iov_len = strlen(what) },
+		{ .iov_base = __DECONST(void *, sep),				.iov_len = 2 },
+		{ .iov_base = __DECONST(void *, arg ? arg : estr),	.iov_len = arg ? strlen(arg) : estr_len },
+		{ .iov_base = __DECONST(void *, arg ? sep : nel),	.iov_len = arg ? 2 : 1 },
+		{ .iov_base = __DECONST(void *, estr),				.iov_len = estr_len },
+		{ .iov_base = __DECONST(void *, nel),				.iov_len = 1 }
 	};
 
 	if (errprefix)
@@ -472,11 +480,11 @@ process_file_actions_entry(struct spawn_args *psa,
 		case FAE_OPEN:
 			/* Perform an open(), make it use the right fd */
 			fd = _openat(fae->fae_atfd,
-						 fae->fae_path,
+						 fae_path(fae),
 						 fae->fae_oflag,
 						 fae->fae_mode);
 			if (fd < 0)
-				return report_err(psa, errno, "openat", fae->fae_path);
+				return report_err(psa, errno, "openat", fae_path(fae));
 
 			if (fd != fae->fae_fildes)
 			{
@@ -522,14 +530,14 @@ process_file_actions_entry(struct spawn_args *psa,
 
 		case FAE_CHROOT:
 			/* Perform a chroot() */
-			if (_chroot(fae->fae_path) < 0)
-				return report_err(psa, errno, "chroot", fae->fae_path);
+			if (_chroot(fae_path(fae)) < 0)
+				return report_err(psa, errno, "chroot", fae_path(fae));
 			return 0;
 
 		case FAE_CHDIR:
 			/* Perform a chdir() */
-			if (_chdir(fae->fae_path) < 0)
-				return report_err(psa, errno, "chdir", fae->fae_path);
+			if (_chdir(fae_path(fae)) < 0)
+				return report_err(psa, errno, "chdir", fae_path(fae));
 			return 0;
 
 		case FAE_FCHDIR:
@@ -1128,6 +1136,16 @@ spawn_file_actions_destroy(spawn_file_actions_t *fa)
     return 0;
 }
 
+__noinline
+static void *
+alloc_with_path(size_t blen, const char *data)
+{
+	size_t plen = strlen(data) + 1;
+	char *ptr = malloc(blen + plen);
+	if (ptr)
+		memcpy(ptr + blen, data, plen);
+	return ptr;
+}
 
 static int
 alloc_action(spawn_file_actions_t * __restrict fa,
@@ -1136,31 +1154,30 @@ alloc_action(spawn_file_actions_t * __restrict fa,
 			 bool have_path)
 {
     spawn_file_actions_entry_t *fae;
-	size_t plen = 0;
 
 	if (have_path)
-		plen = strlen(path) + 1;
+		fae = alloc_with_path(sizeof(spawn_file_actions_entry_t), path);
+	else
+		fae = malloc(sizeof(spawn_file_actions_entry_t));
 
-    fae = malloc(sizeof(spawn_file_actions_entry_t) + plen);
-    if (fae == NULL)
+	if (fae == NULL)
 		return errno;
 
 	*fae = *fae_in;
-	if (have_path)
-	{
-		char *npath = (char *)(fae + 1);
-		memcpy(npath, path, plen);
-		fae->fae_path = npath;
-	}
-	else
-		fae->fae_path = NULL;
 
 	STAILQ_INSERT_TAIL(&(*fa)->fa_list, fae, fae_list);
     return 0;
 }
 
-#define FAE_ALLOC(fa_,...) alloc_action(fa_, &((spawn_file_actions_entry_t){ __VA_ARGS__ }), NULL, false)
-#define FAE_ALLOC_PATH(fa_,path_,...) alloc_action(fa_, &((spawn_file_actions_entry_t){ __VA_ARGS__ }), (path_), true)
+#define FAE_ALLOC(fa_,...)											\
+	alloc_action(fa_,												\
+				 &((spawn_file_actions_entry_t){ __VA_ARGS__ }),	\
+				 NULL, false)
+
+#define FAE_ALLOC_PATH(fa_,path_,...)								\
+	alloc_action(fa_,												\
+				 &((spawn_file_actions_entry_t){ __VA_ARGS__ }),	\
+				 (path_), true)
 
 int
 spawn_file_actions_addopen(spawn_file_actions_t * __restrict fa,
@@ -1316,6 +1333,8 @@ spawnattr_init(spawnattr_t *ret)
 	/* Set defaults as specified by POSIX, cleared above */
 	*sa = nullsa;
 	sigfillset(&sa->sa_sigdefault);
+	sigemptyset(&sa->sa_sigignore);
+	sigemptyset(&sa->sa_sigmask);
 	*ret = sa;
 	return 0;
 }
@@ -1388,9 +1407,9 @@ spawnattr_getsigmask(const spawnattr_t * __restrict sa,
 
 int
 spawnattr_getrlimit_np(const spawnattr_t * __restrict sa,
-					int rlim,
-					bool * __restrict isset,
-					struct rlimit * __restrict val)
+					   int rlim,
+					   bool * __restrict isset,
+					   struct rlimit * __restrict val)
 {
 	if (rlim < 0 || rlim >= RLIM_NLIMITS)
 		return EINVAL;
