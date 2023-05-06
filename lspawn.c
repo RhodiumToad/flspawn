@@ -2541,6 +2541,8 @@ MODENTRY(lua_State *L)
 {
 	lua_settop(L, 0);
 
+	luaL_checkversion(L);
+
 	// metatables for FA objects
 	make_metatable(L, &lspawn_file_action_meta, 0);
 	make_metatable(L, &lspawn_file_actions_meta, 0);
