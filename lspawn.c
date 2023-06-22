@@ -70,7 +70,7 @@ to_intx(lua_State *L, int idx, int *isint)
 		*isint = 0;
 		return 0;
 	}
-	return res;
+	return (int) res;
 }
 
 static int
@@ -79,7 +79,7 @@ opt_int(lua_State *L, int idx, int def)
 	lua_Integer res = luaL_optinteger(L, idx, def);
 	if (res < INT_MIN || res > INT_MAX)
 		return luaL_argerror(L, idx, "integer argument out of range");
-	return res;
+	return (int) res;
 }
 
 static int
@@ -88,7 +88,7 @@ check_int(lua_State *L, int idx)
 	lua_Integer res = luaL_checkinteger(L, idx);
 	if (res < INT_MIN || res > INT_MAX)
 		return luaL_argerror(L, idx, "integer argument out of range");
-	return res;
+	return (int) res;
 }
 
 // This ought to be luaL_execresult, but in 5.4 that is broken due to a very
@@ -727,7 +727,7 @@ process_files(lua_State *L,
 		if (fd_out >= fd_clamp)
 			return luaL_argerror(L, 1, "bad entry in files table, descriptor exceeds resource limit");
 		if (fd_out > hiwat_out)
-			hiwat_out = fd_out;
+			hiwat_out = (int) fd_out;
 		if (metaloop)
 			lua_rawseti(L, tmpt_idx, fd_out);
 		else
@@ -1408,7 +1408,7 @@ process_siglist(lua_State *L,
 	}
 
 	if (!is_indexable(L, -1, typ))
-		return luaL_error(L, "bad signal %s table, expected indexable value", name);
+		return (void) luaL_error(L, "bad signal %s table, expected indexable value", name), false;
 
 	for (int i = 1; (argt = lua_geti(L, -1, i)) != LUA_TNIL; ++i)
 	{
@@ -1429,7 +1429,7 @@ process_siglist(lua_State *L,
 		else
 			rc = -1;
 		if (rc < 0)
-			return luaL_argerror(L, 1, "bad entry in signals table");
+			return (void) luaL_argerror(L, 1, "bad entry in signals table"), false;
 		lua_pop(L, 1);
 	}
 	lua_pop(L, 2);
@@ -1958,7 +1958,7 @@ lspawn_call_do_args(lua_State *L, int idx)
 	lua_pushnil(L);
 	while (lua_next(L, lua_upvalueindex(1)))
 	{
-		int i = lua_tointeger(L, -1);		// trusted source
+		int i = (int) lua_tointeger(L, -1);		// trusted source
 
 		lua_copy(L, -2, -1);
 		int argt = lua_gettable(L, idx);
@@ -2052,7 +2052,7 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 
 	spawnattr_t	sa;
 	spawn_file_actions_t *file_acts;
-	short		spawn_attr_flags = (SPAWN_SETSIGDEF
+	uint32_t	spawn_attr_flags = (SPAWN_SETSIGDEF
 									| SPAWN_SETSIGIGN_NP
 									| SPAWN_SETSIGMASK);
 	pid_t		pgrp = 0;
@@ -2148,13 +2148,13 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 		spawn_attr_flags |= SPAWN_SETPGROUP;
 	}
 	if (lua_toboolean(L, SIDX_FOREGROUND))
-		foreground_fd = lua_tointeger(L, SIDX_FOREGROUND);
+		foreground_fd = (int) lua_tointeger(L, SIDX_FOREGROUND);
 	if (lua_toboolean(L, SIDX_CLEANENV))
 		inherit_env = false;
 	if (!lua_isnil(L, SIDX_JAIL_BEFORE))
-		jail_before = lua_tointeger(L, SIDX_JAIL_BEFORE);
+		jail_before = (int) lua_tointeger(L, SIDX_JAIL_BEFORE);
 	if (!lua_isnil(L, SIDX_JAIL_AFTER))
-		jail_after = lua_tointeger(L, SIDX_JAIL_AFTER);
+		jail_after = (int) lua_tointeger(L, SIDX_JAIL_AFTER);
 
 	if (jail_before >= 0 && jail_after >= 0)
 		return luaL_argerror(L, 1, "cannot specify both jail_before and jail_after");
@@ -2203,9 +2203,9 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 				return luaL_error(L, "get_maxfilesperproc: %s", strerror(errno));
 
 			if (fd_clamp > rlim[RLIMIT_NOFILE].rlim_max)
-				fd_clamp = rlim[RLIMIT_NOFILE].rlim_max;
+				fd_clamp = (int) rlim[RLIMIT_NOFILE].rlim_max;
 			if (fd_clamp > rlim[RLIMIT_NOFILE].rlim_cur)
-				fd_clamp = rlim[RLIMIT_NOFILE].rlim_cur;
+				fd_clamp = (int) rlim[RLIMIT_NOFILE].rlim_cur;
 		}
 	}
 
@@ -2323,7 +2323,7 @@ lspawn_doit(lua_State *L, enum spawn_op context)
 	spawnattr_setsigmask(&sa, &block_sigs);
 	if (errprefix)
 		err = spawnattr_seterrprefix_np(&sa, errprefix);
-	spawnattr_setflags(&sa, spawn_attr_flags);
+	spawnattr_setflags_np(&sa, spawn_attr_flags);
 
 	for (int res = 0; res < RLIM_NLIMITS; ++res)
 		if (err == 0 && rlim_set[res])

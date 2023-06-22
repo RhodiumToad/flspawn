@@ -25,9 +25,9 @@ typedef struct spawn_file_actions	*spawn_file_actions_t;
 #define SPAWN_SETSIGMASK	0x0020
 #define SPAWN_SETSID		0x0040
 /* non-POSIX extensions */
-#define SPAWN_SETSIGIGN_NP	0x2000
-#define SPAWN_SETRLIMITS_NP	0x4000
-#define SPAWN_VERBOSE_NP	((short)0x8000U)
+#define SPAWN_SETSIGIGN_NP	0x20000000U
+#define SPAWN_SETRLIMITS_NP	0x40000000U
+#define SPAWN_VERBOSE_NP	0x80000000U
 
 int spawn(pid_t * __restrict, const char * __restrict,
     const spawn_file_actions_t *, const spawnattr_t * __restrict,
@@ -75,6 +75,8 @@ int spawnattr_destroy(spawnattr_t *);
 
 int spawnattr_getflags(const spawnattr_t * __restrict,
     short * __restrict);
+int spawnattr_getflags_np(const spawnattr_t * __restrict,
+    uint32_t * __restrict);
 int spawnattr_getpgroup(const spawnattr_t * __restrict,
     pid_t * __restrict);
 int spawnattr_getschedparam(const spawnattr_t * __restrict,
@@ -94,6 +96,7 @@ int spawnattr_getrlimit_np(const spawnattr_t * __restrict,
 						   struct rlimit * __restrict);
 
 int spawnattr_setflags(spawnattr_t *, short);
+int spawnattr_setflags_np(spawnattr_t *, uint32_t);
 int spawnattr_setpgroup(spawnattr_t *, pid_t);
 int spawnattr_setschedparam(spawnattr_t * __restrict,
     const struct sched_param * __restrict);

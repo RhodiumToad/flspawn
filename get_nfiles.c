@@ -3,6 +3,8 @@
 #include <sys/param.h>
 #include <sys/sysctl.h>
 
+#include "get_nfiles.h"
+
 int get_nfiles(void)
 {
 	int nfiles = 0;

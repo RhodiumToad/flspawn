@@ -134,7 +134,7 @@ extern void __gcov_flush(void);
 /* private data structs */
 
 struct spawnattr {
-    short		sa_flags;
+    uint32_t	sa_flags;
     pid_t		sa_pgroup;
     int			sa_schedpolicy;
     sigset_t	sa_sigdefault;
@@ -1353,6 +1353,14 @@ int
 spawnattr_getflags(const spawnattr_t * __restrict sa,
 				   short * __restrict flags)
 {
+	*flags = (short)((*sa)->sa_flags & 0x7FFF);
+	return 0;
+}
+
+int
+spawnattr_getflags_np(const spawnattr_t * __restrict sa,
+					  uint32_t * __restrict flags)
+{
 	*flags = (*sa)->sa_flags;
 	return 0;
 }
@@ -1420,6 +1428,14 @@ spawnattr_getrlimit_np(const spawnattr_t * __restrict sa,
 
 int
 spawnattr_setflags(spawnattr_t *sa, short flags)
+{
+	(*sa)->sa_flags = (((*sa)->sa_flags & ~(uint32_t)0xFFFFU)
+					   | ((unsigned short)flags & 0x7FFF));
+	return 0;
+}
+
+int
+spawnattr_setflags_np(spawnattr_t *sa, uint32_t flags)
 {
 	(*sa)->sa_flags = flags;
 	return 0;
